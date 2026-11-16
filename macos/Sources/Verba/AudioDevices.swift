@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import AudioToolbox
 import CoreAudio
@@ -12,21 +13,16 @@ enum SystemAudioPermission {
         case denied
     }
 
-    private typealias PreflightFn = @convention(c) (CFString, CFDictionary?) -> Int
-    private typealias RequestFn = @convention(c) (CFString, CFDictionary?, @escaping (Bool) -> Void) -> Void
+    private typealias PreflightFn = @convention(c) (CFString, CFDictionary?) -> Int32
 
     private static let tccHandle: UnsafeMutableRawPointer? = {
-        dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_LAZY)
+        dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_LAZY)
+            ?? dlopen("/System/Library/PrivateFrameworks/TCC.framework/TCC", RTLD_LAZY)
     }()
 
     private static let preflightFn: PreflightFn? = {
         guard let h = tccHandle, let sym = dlsym(h, "TCCAccessPreflight") else { return nil }
         return unsafeBitCast(sym, to: PreflightFn.self)
-    }()
-
-    private static let requestFn: RequestFn? = {
-        guard let h = tccHandle, let sym = dlsym(h, "TCCAccessRequest") else { return nil }
-        return unsafeBitCast(sym, to: RequestFn.self)
     }()
 
     static let serviceKey = "kTCCServiceAudioCapture" as CFString
@@ -40,13 +36,9 @@ enum SystemAudioPermission {
         }
     }
 
-    static func request() async -> Bool {
-        if status() == .granted { return true }
-        guard let fn = requestFn else { return true }
-        return await withCheckedContinuation { cont in
-            fn(serviceKey, nil) { allowed in
-                cont.resume(returning: allowed)
-            }
+    static func openPrivacySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture") {
+            NSWorkspace.shared.open(url)
         }
     }
 }
@@ -222,10 +214,23 @@ final class SystemAudioTap {
     private var aggregateID: AudioObjectID = kAudioObjectUnknown
     private var audioUnit: AudioComponentInstance?
     private var renderFormat: AVAudioFormat?
+    private var monoFormat: AVAudioFormat?
     private var onBuffer: ((AVAudioPCMBuffer) -> Void)?
     private var onRateChange: (() -> Void)?
     private var rateListenerBlock: AudioObjectPropertyListenerBlock?
     private var listenedDeviceID: AudioDeviceID = kAudioObjectUnknown
+
+    private static func nominalSampleRate(_ device: AudioObjectID) -> Float64? {
+        var rate: Float64 = 0
+        var size = UInt32(MemoryLayout<Float64>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &rate)
+        return (status == noErr && rate > 0) ? rate : nil
+    }
 
     func start(
         onBuffer: @escaping (AVAudioPCMBuffer) -> Void,
@@ -244,6 +249,7 @@ final class SystemAudioTap {
         let excluded: [AudioObjectID] = AudioDevices.processObjectID(pid: ownPID).map { [$0] } ?? []
         let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
         desc.name = "VerbaSystemTap"
+        desc.isPrivate = true
         desc.muteBehavior = .unmuted
 
         var createdTap = AudioObjectID(kAudioObjectUnknown)
@@ -329,18 +335,23 @@ final class SystemAudioTap {
         try checkAU(AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &streamDesc, &propSize))
 
         let desiredChannels: UInt32 = 2
-        var channelMap: [Int32] = [outOwnInputChannels, outOwnInputChannels + 1]
-        _ = AudioUnitSetProperty(
-            unit,
-            kAudioOutputUnitProperty_ChannelMap,
-            kAudioUnitScope_Output,
-            1,
-            &channelMap,
-            UInt32(channelMap.count * MemoryLayout<Int32>.size)
-        )
+        if outOwnInputChannels > 0 {
+            var channelMap: [Int32] = [outOwnInputChannels, outOwnInputChannels + 1]
+            _ = AudioUnitSetProperty(
+                unit,
+                kAudioOutputUnitProperty_ChannelMap,
+                kAudioUnitScope_Output,
+                1,
+                &channelMap,
+                UInt32(channelMap.count * MemoryLayout<Int32>.size)
+            )
+        }
+
+        let unitRate = streamDesc.mSampleRate > 0 ? streamDesc.mSampleRate : 48_000
+        let actualRate = Self.nominalSampleRate(createdAgg) ?? Self.nominalSampleRate(outID) ?? unitRate
 
         var clientFormat = AudioStreamBasicDescription(
-            mSampleRate: streamDesc.mSampleRate,
+            mSampleRate: unitRate,
             mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved,
             mBytesPerPacket: 4,
@@ -352,11 +363,13 @@ final class SystemAudioTap {
         )
         try checkAU(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &clientFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)))
 
-        guard let avFormat = AVAudioFormat(streamDescription: &clientFormat) else {
+        guard let avFormat = AVAudioFormat(streamDescription: &clientFormat),
+              let monoFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: actualRate, channels: 1, interleaved: false) else {
             stop()
             throw TapError.invalidFormat
         }
         self.renderFormat = avFormat
+        self.monoFormat = monoFmt
 
         var cbStruct = AURenderCallbackStruct(
             inputProc: Self.renderCallback,
@@ -417,6 +430,7 @@ final class SystemAudioTap {
             tapID = kAudioObjectUnknown
         }
         renderFormat = nil
+        monoFormat = nil
         onBuffer = nil
         onRateChange = nil
     }
@@ -431,7 +445,23 @@ final class SystemAudioTap {
         guard let pcm = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: inNumberFrames) else { return noErr }
         pcm.frameLength = inNumberFrames
         let status = AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, pcm.mutableAudioBufferList)
-        if status == noErr, pcm.frameLength > 0 {
+        guard status == noErr, pcm.frameLength > 0 else { return status }
+
+        if let monoFmt = me.monoFormat,
+           let mono = AVAudioPCMBuffer(pcmFormat: monoFmt, frameCapacity: inNumberFrames),
+           let src = pcm.floatChannelData,
+           let dst = mono.floatChannelData {
+            mono.frameLength = inNumberFrames
+            let n = Int(inNumberFrames)
+            if pcm.format.channelCount >= 2 {
+                for i in 0..<n {
+                    dst[0][i] = (src[0][i] + src[1][i]) * 0.5
+                }
+            } else {
+                memcpy(dst[0], src[0], n * MemoryLayout<Float>.size)
+            }
+            me.onBuffer?(mono)
+        } else {
             me.onBuffer?(pcm)
         }
         return status
@@ -699,9 +729,7 @@ final class AudioRouter {
             let elapsed = AVAudioFramePosition(max(0, Date().timeIntervalSince(self.startDate)) * 16_000.0)
             self.writer?.appendSystem(pcm, elapsedFrames: elapsed)
             self.recordRing(pcm)
-            if self.sysVAD.hasSpeech(pcm) || lvl > 0.002 {
-                self.onSystemPCM?(pcm)
-            }
+            self.onSystemPCM?(pcm)
         }
     }
 
@@ -711,9 +739,7 @@ final class AudioRouter {
             let lvl = self.roomVAD.rms(pcm)
             guard self.echoGate.shouldAcceptRoom(rms: lvl) else { return }
             self.writer?.appendRoom(pcm)
-            if self.roomVAD.hasSpeech(pcm) {
-                self.onRoomPCM?(pcm)
-            }
+            self.onRoomPCM?(pcm)
         }
     }
 

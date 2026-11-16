@@ -145,6 +145,27 @@ struct MainRecordsView: View {
             }
             .padding(10)
 
+            if let err = model.lastError, !err.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(err)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .lineLimit(3)
+                    if model.systemAudioDenied {
+                        Button("打开系统音频授权设置") {
+                            SystemAudioPermission.openPrivacySettings()
+                        }
+                        .controlSize(.mini)
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(hex: 0xFEF2F2))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .padding(.horizontal, 10)
+                .padding(.bottom, 6)
+            }
+
             if let prog = model.importProgress {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
@@ -467,6 +488,24 @@ struct MainRecordsView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
 
+            if model.listening {
+                Button {
+                    model.toggleOverlayManually()
+                } label: {
+                    Label(model.overlayVisible ? "隐藏浮层" : "显示字幕", systemImage: "captions.bubble")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    model.onOpenNotesWindow?()
+                } label: {
+                    Label("实时笔记", systemImage: "note.text")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
             Button {
                 Task { await model.generateNotes(sessionId: s.id, fresh: true) }
             } label: {
@@ -578,12 +617,73 @@ struct MainRecordsView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
+                    if s.lines.isEmpty && !(model.listening && model.liveSession?.id == s.id && model.draft != nil) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(model.listening && model.liveSession?.id == s.id ? "正在实时监听系统声音…" : "暂无文字记录")
+                                .font(.system(size: 13.5, weight: .medium))
+                                .foregroundStyle(Color(hex: 0x15171C))
+                            Text(model.listening && model.liveSession?.id == s.id
+                                 ? "播放会议、视频或语音后，设备端将自动转写并通过 Loom 实时出字幕。"
+                                 : "可通过上方按钮开始聆听或导入音视频文件。")
+                                .font(.caption)
+                                .foregroundStyle(Color(hex: 0x6B7080))
+                        }
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+
                     ForEach(s.lines) { line in
                         transcriptLineCard(s, line)
                             .id(line.id)
                     }
+
+                    if model.listening && model.liveSession?.id == s.id, let draft = model.draft {
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(Color(hex: 0xE8552B))
+                                    .frame(width: 7, height: 7)
+                                Text(draft.speaker == "me" ? "我 · 识别中" : "对方 · 识别中")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(Color(hex: 0xE8552B))
+                                Spacer()
+                                Text(AppModel.formatClock(draft.t))
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(Color(hex: 0x6B7080))
+                            }
+                            Text(draft.src)
+                                .font(.system(size: 13.5))
+                                .foregroundStyle(Color(hex: 0x15171C))
+                            if let dst = draft.dst, !dst.isEmpty {
+                                Text(dst)
+                                    .font(.system(size: 13.5))
+                                    .foregroundStyle(Color(hex: 0x4B5563))
+                            }
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(hex: 0xFFF7F4))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color(hex: 0xE8552B).opacity(0.45), style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .id("live-draft")
+                    }
                 }
                 .padding(16)
+            }
+            .onChange(of: s.lines.count) { _, _ in
+                if model.listening && model.liveSession?.id == s.id, let lastId = s.lines.last?.id {
+                    withAnimation { proxy.scrollTo(model.draft != nil ? "live-draft" : lastId, anchor: .bottom) }
+                }
+            }
+            .onChange(of: model.draft?.src) { _, _ in
+                if model.listening && model.liveSession?.id == s.id && model.draft != nil {
+                    proxy.scrollTo("live-draft", anchor: .bottom)
+                }
             }
             .onChange(of: highlightedLineId) { _, target in
                 if let target {

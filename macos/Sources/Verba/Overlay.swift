@@ -62,7 +62,7 @@ final class SubtitleOverlayController {
         didSet {
             if oldValue != editMode {
                 panel?.ignoresMouseEvents = !editMode
-                refreshContent()
+                model.overlayEditMode = editMode
             }
         }
     }
@@ -92,7 +92,6 @@ final class SubtitleOverlayController {
 
         if shouldShow {
             ensurePanel()
-            refreshContent()
             if !(panel?.isVisible ?? false) {
                 panel?.alphaValue = 0
                 panel?.orderFrontRegardless()
@@ -127,7 +126,7 @@ final class SubtitleOverlayController {
 
         panel = p
         installMouseTracking()
-        refreshContent()
+        installRootView()
     }
 
     private func defaultOverlayFrame() -> NSRect {
@@ -209,11 +208,10 @@ final class SubtitleOverlayController {
         }
     }
 
-    private func refreshContent() {
+    private func installRootView() {
         guard let panel else { return }
         let view = SubtitleOverlayView(
             model: model,
-            editMode: editMode,
             onDragDelta: { [weak self] dx, dy in
                 guard let self, let p = self.panel else { return }
                 var f = p.frame
@@ -250,13 +248,14 @@ final class SubtitleOverlayController {
 
 private struct SubtitleOverlayView: View {
     @ObservedObject var model: AppModel
-    let editMode: Bool
     let onDragDelta: (CGFloat, CGFloat) -> Void
     let onResize: (CGFloat, CGFloat, Bool) -> Void
     let onOpenNotes: () -> Void
     let onHide: () -> Void
 
     @State private var lastDrag: CGSize = .zero
+
+    private var editMode: Bool { model.overlayEditMode }
 
     private var activeLines: [TranscriptLine] {
         let lines = model.liveSession?.lines ?? []

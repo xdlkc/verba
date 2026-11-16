@@ -170,7 +170,7 @@ struct SessionSummary: Codable, Identifiable, Equatable {
 struct DraftSubtitle: Codable, Equatable {
     let speaker: String
     let src: String
-    let dst: String?
+    var dst: String?
     let srcLang: String
     let dstLang: String
     let t: Double

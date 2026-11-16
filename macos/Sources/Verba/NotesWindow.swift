@@ -343,9 +343,43 @@ struct NotesPanelView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 8))
                             .id(line.id)
                         }
+
+                        if model.listening && model.liveSession?.id == s.id, let d = model.draft {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 5) {
+                                    Circle().fill(Color(hex: 0xE8552B)).frame(width: 6, height: 6)
+                                    Text(d.speaker == "me" ? "我 · 识别中" : "对方 · 识别中")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(Color(hex: 0xE8552B))
+                                }
+                                Text(d.src)
+                                    .font(.system(size: 12.5))
+                                    .foregroundStyle(Color(hex: 0x15171C))
+                                if let dst = d.dst, !dst.isEmpty {
+                                    Text(dst)
+                                        .font(.system(size: 12.5))
+                                        .foregroundStyle(Color(hex: 0x4B5563))
+                                }
+                            }
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color(hex: 0xFFF7F4))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .id("notes-live-draft")
+                        }
                     }
                 }
                 .padding(10)
+            }
+            .onChange(of: activeSession?.lines.count) { _, _ in
+                if model.listening, let last = activeSession?.lines.last?.id {
+                    proxy.scrollTo(model.draft != nil ? "notes-live-draft" : last, anchor: .bottom)
+                }
+            }
+            .onChange(of: model.draft?.src) { _, _ in
+                if model.listening && model.draft != nil {
+                    proxy.scrollTo("notes-live-draft", anchor: .bottom)
+                }
             }
             .onChange(of: highlightedLineId) { _, target in
                 if let target {

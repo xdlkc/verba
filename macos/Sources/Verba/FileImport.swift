@@ -65,9 +65,11 @@ enum FileImporter {
         await copyPlayableAudioIfPossible(asset: asset, toFolder: URL(fileURLWithPath: begin.audioFolder))
 
         let resolvedLang = sourceLang == "auto" ? "en" : sourceLang
-        guard let recognizer = SFSpeechRecognizer(locale: Languages.locale(for: resolvedLang)),
-              recognizer.isAvailable else {
-            throw FileImportError.recognizerUnavailable(resolvedLang)
+        if !SpeechPermission.usesSpeechAnalyzer {
+            guard let recognizer = SFSpeechRecognizer(locale: Languages.locale(for: resolvedLang)),
+                  recognizer.isAvailable else {
+                throw FileImportError.recognizerUnavailable(resolvedLang)
+            }
         }
 
         // Read audio in 35-second chunks and run on-device recognition per chunk
@@ -93,7 +95,7 @@ enum FileImporter {
 
             let pcmBuffers = try extract16kHzPCM(asset: asset, tracks: tracks, timeRange: range)
             if !pcmBuffers.isEmpty {
-                let text = try await recognizeChunk(recognizer: recognizer, buffers: pcmBuffers)
+                let text = try await OnDeviceSpeechStream.transcribeBuffers(pcmBuffers, langCode: resolvedLang)
                 let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !cleaned.isEmpty {
                     let detector = LanguageDetector()
@@ -190,41 +192,5 @@ enum FileImporter {
             }
         }
         return result
-    }
-
-    private static func recognizeChunk(
-        recognizer: SFSpeechRecognizer,
-        buffers: [AVAudioPCMBuffer]
-    ) async throws -> String {
-        let req = SFSpeechAudioBufferRecognitionRequest()
-        req.shouldReportPartialResults = false
-        req.addsPunctuation = true
-        if recognizer.supportsOnDeviceRecognition {
-            req.requiresOnDeviceRecognition = true
-        }
-        for b in buffers {
-            req.append(b)
-        }
-        req.endAudio()
-
-        return try await withCheckedThrowingContinuation { cont in
-            var resumed = false
-            recognizer.recognitionTask(with: req) { result, error in
-                if resumed { return }
-                if let result, result.isFinal {
-                    resumed = true
-                    cont.resume(returning: result.bestTranscription.formattedString)
-                } else if let error {
-                    resumed = true
-                    // No speech detected in a silent chunk should not abort import
-                    let nsErr = error as NSError
-                    if nsErr.domain == "kAFAssistantErrorDomain" || nsErr.code == 1110 {
-                        cont.resume(returning: "")
-                    } else {
-                        cont.resume(throwing: error)
-                    }
-                }
-            }
-        }
     }
 }

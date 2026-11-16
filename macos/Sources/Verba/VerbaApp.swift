@@ -45,13 +45,21 @@ struct MenuBarPopoverView: View {
             }
 
             if let err = model.lastError, !err.isEmpty {
-                Text(err)
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(hex: 0xFEF2F2))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(err)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                    if model.systemAudioDenied {
+                        Button("打开系统音频授权设置") {
+                            SystemAudioPermission.openPrivacySettings()
+                        }
+                        .controlSize(.mini)
+                    }
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(hex: 0xFEF2F2))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
             }
 
             Button {

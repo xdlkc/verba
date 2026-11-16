@@ -45,11 +45,13 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published var notesLoading = false
     @Published var notesError: String?
     @Published var lastError: String?
+    @Published var systemAudioDenied = false
     @Published var audioLevel: Float = 0
     @Published var importProgress: ImportProgress?
 
     // Overlay visibility & mode
     @Published var overlayVisible = false
+    @Published var overlayEditMode = false
     @Published var overlayLastSpeechAt = Date.distantPast
 
     // Synchronized audio playback
@@ -68,6 +70,9 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private let langDetector = LanguageDetector()
     private var lastAutoSwitchAt = Date.distantPast
     private var currentActiveLang = "en"
+    private var lastDraftSentAt = Date.distantPast
+    private var draftSendInFlight = false
+    private var lastLocalDraftAt = Date.distantPast
 
     private var player: AVAudioPlayer?
     private var playbackTimer: Timer?
@@ -84,6 +89,7 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     func bootstrap() {
         guard !bootStarted else { return }
         bootStarted = true
+        systemAudioDenied = SystemAudioPermission.status() == .denied
         Task { [self] in
             let ok = await backend.ensureRunning()
             engineReady = ok
@@ -143,9 +149,16 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             settings = updated
             onOverlayUpdated?()
         case .draftUpdated(let d):
-            draft = d
-            if d != nil {
+            if let d {
+                if var cur = draft, cur.speaker == d.speaker, cur.src.count > d.src.count {
+                    cur.dst = d.dst ?? cur.dst
+                    draft = cur
+                } else {
+                    draft = d
+                }
                 markSpeechActivity()
+            } else if !listening || Date().timeIntervalSince(lastLocalDraftAt) > 0.35 {
+                draft = nil
             }
             onOverlayUpdated?()
         case .lineUpdated(let sid, let line):
@@ -233,8 +246,10 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             return
         }
 
-        if SystemAudioPermission.status() == .unknown {
-            _ = await SystemAudioPermission.request()
+        systemAudioDenied = SystemAudioPermission.status() == .denied
+        if systemAudioDenied {
+            lastError = "「仅系统音频录制」权限未开启，请点击「打开系统设置」授权后重启 Verba。"
+            return
         }
 
         do {
@@ -243,6 +258,8 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             liveSession = started.session
             selectedSessionId = started.session.id
             selectedSession = started.session
+            lastDraftSentAt = .distantPast
+            draftSendInFlight = false
 
             let initialLang = settings.sourceLang == "auto" ? "en" : settings.sourceLang
             currentActiveLang = initialLang
@@ -260,11 +277,18 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 stream?.append(pcm)
             }
 
-            stream.start { [weak self] seg in
-                Task { @MainActor [weak self] in
-                    await self?.handleRecognizedSegment(seg, speaker: "them", via: "system")
+            stream.start(
+                onResult: { [weak self] seg in
+                    Task { @MainActor [weak self] in
+                        await self?.handleRecognizedSegment(seg, speaker: "them", via: "system")
+                    }
+                },
+                onError: { [weak self] errMsg in
+                    Task { @MainActor [weak self] in
+                        self?.lastError = errMsg
+                    }
                 }
-            }
+            )
 
             try systemTap.start(
                 onBuffer: { [weak self] pcm in
@@ -283,19 +307,27 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 router.onRoomPCM = { [weak rStream] pcm in
                     rStream?.append(pcm)
                 }
-                rStream.start { [weak self] seg in
-                    Task { @MainActor [weak self] in
-                        await self?.handleRecognizedSegment(seg, speaker: "me", via: "room")
+                rStream.start(
+                    onResult: { [weak self] seg in
+                        Task { @MainActor [weak self] in
+                            await self?.handleRecognizedSegment(seg, speaker: "me", via: "room")
+                        }
+                    },
+                    onError: { [weak self] errMsg in
+                        Task { @MainActor [weak self] in
+                            self?.lastError = errMsg
+                        }
                     }
-                }
+                )
                 let devID = selectedRoomMicID.map { AudioDeviceID($0) }
                 try? roomMic.start(deviceID: devID) { [weak self] pcm in
                     self?.router.pushRoom(pcm)
                 }
             }
 
-            if settings.overlayMode == "always" {
+            if settings.overlayMode != "off" {
                 overlayVisible = true
+                overlayLastSpeechAt = Date()
             }
             onOverlayUpdated?()
             startLiveNotesTicker()
@@ -383,10 +415,47 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             }
         }
         markSpeechActivity()
+
+        if !seg.isFinal {
+            lastLocalDraftAt = Date()
+            let prevDst = (draft?.speaker == speaker) ? draft?.dst : nil
+            draft = DraftSubtitle(
+                speaker: speaker,
+                src: seg.text,
+                dst: prevDst,
+                srcLang: effectiveLang,
+                dstLang: settings.targetLang,
+                t: liveSession.map { max(0, Date().timeIntervalSince($0.startedAt)) } ?? 0,
+                voice: nil,
+                via: via
+            )
+            onOverlayUpdated?()
+
+            guard !draftSendInFlight && Date().timeIntervalSince(lastDraftSentAt) >= 0.45 else {
+                return
+            }
+            draftSendInFlight = true
+            lastDraftSentAt = Date()
+            defer { draftSendInFlight = false }
+            try? await backend.postPiece(
+                text: seg.text,
+                speaker: speaker,
+                isFinal: false,
+                lang: effectiveLang,
+                via: via,
+                cut: false
+            )
+            return
+        }
+
+        if draft?.speaker == speaker {
+            draft = nil
+        }
+        onOverlayUpdated?()
         try? await backend.postPiece(
             text: seg.text,
             speaker: speaker,
-            isFinal: seg.isFinal,
+            isFinal: true,
             lang: effectiveLang,
             via: via,
             cut: seg.cut
