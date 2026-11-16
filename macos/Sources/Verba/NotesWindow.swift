@@ -1,27 +1,46 @@
 import AppKit
 import SwiftUI
 
-// MARK: - Anti-Capture Floating Notes Window (Non-Activating)
+// MARK: - Anti-Capture Floating Notes Window (Non-Activating, First-Click Responsive)
 
 private final class NotesPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 }
 
+private final class FirstClickHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 @MainActor
 final class NotesWindowController: NSObject, NSWindowDelegate {
+    enum LayoutMode { case card, sidebar, wide }
+
     private let model: AppModel
     private var panel: NotesPanel?
-    private let frameKey = "VerbaNotesWindowFrame"
+    private let autosaveName = "VerbaNotesWindowV2"
+    private let onTopKey = "verba.notes.onTop"
+
+    var onTop: Bool {
+        get { UserDefaults.standard.object(forKey: onTopKey) as? Bool ?? true }
+        set {
+            UserDefaults.standard.set(newValue, forKey: onTopKey)
+            panel?.level = newValue ? .floating : .normal
+            panel?.isFloatingPanel = newValue
+            model.notesOnTop = newValue
+        }
+    }
 
     init(model: AppModel) {
         self.model = model
+        super.init()
+        model.notesOnTop = onTop
     }
 
     func show() {
         ensurePanel()
-        panel?.sharingType = model.settings.notesCapturable ? .readOnly : .none
-        panel?.makeKeyAndOrderFront(nil)
+        syncCaptureSetting()
+        panel?.orderFrontRegardless()
     }
 
     func toggle() {
@@ -36,45 +55,74 @@ final class NotesWindowController: NSObject, NSWindowDelegate {
         panel?.sharingType = model.settings.notesCapturable ? .readOnly : .none
     }
 
+    func resize(layout: LayoutMode) {
+        guard let p = panel, let screen = p.screen ?? NSScreen.main else { return }
+        let targetW: CGFloat
+        let targetH: CGFloat?
+        switch layout {
+        case .card:
+            targetW = 320
+            targetH = 260
+        case .sidebar:
+            targetW = 440
+            targetH = min(720, screen.visibleFrame.height - 48)
+        case .wide:
+            targetW = 800
+            targetH = min(760, screen.visibleFrame.height - 48)
+        }
+        var f = p.frame
+        let top = f.maxY
+        let right = f.maxX
+        f.size.width = min(targetW, screen.visibleFrame.width - 24)
+        if let th = targetH {
+            f.size.height = th
+        }
+        f.origin.x = min(max(screen.visibleFrame.minX + 12, right - f.size.width), screen.visibleFrame.maxX - f.size.width - 12)
+        f.origin.y = max(screen.visibleFrame.minY + 12, top - f.size.height)
+        p.setFrame(f, display: true, animate: true)
+    }
+
     private func ensurePanel() {
         if panel != nil {
             syncCaptureSetting()
             return
         }
-        let rect: NSRect = {
-            if let saved = UserDefaults.standard.string(forKey: frameKey) {
-                let r = NSRectFromString(saved)
-                if r.width >= 240 && r.height >= 260 { return r }
-            }
-            let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
-            return NSRect(x: screen.maxX - 420, y: screen.midY - 290, width: 390, height: 580)
-        }()
+        let v = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
+        let defaultRect = NSRect(x: v.maxX - 456, y: v.minY + 28, width: 440, height: min(740, v.height - 56))
 
         let p = NotesPanel(
-            contentRect: rect,
-            styleMask: [.titled, .closable, .resizable, .utilityWindow, .nonactivatingPanel],
+            contentRect: defaultRect,
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        p.title = "Verba · 实时笔记"
-        p.isFloatingPanel = true
-        p.level = .floating
-        p.minSize = NSSize(width: 240, height: 280)
+        p.titleVisibility = .hidden
+        p.titlebarAppearsTransparent = true
+        p.isMovableByWindowBackground = true
+        p.isFloatingPanel = onTop
+        p.level = onTop ? .floating : .normal
+        p.hidesOnDeactivate = false
+        p.becomesKeyOnlyIfNeeded = true
+        p.isReleasedWhenClosed = false
+        p.minSize = NSSize(width: 280, height: 220)
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         p.sharingType = model.settings.notesCapturable ? .readOnly : .none
         p.delegate = self
 
-        let hosting = NSHostingView(rootView: NotesPanelView(model: model))
-        p.contentView = hosting
+        let root = NotesPanelView(
+            model: model,
+            onResizeLayout: { [weak self] mode in self?.resize(layout: mode) },
+            onToggleOnTop: { [weak self] in
+                guard let self else { return }
+                self.onTop.toggle()
+            }
+        )
+        p.contentView = FirstClickHostingView(rootView: root)
+        p.setFrameAutosaveName(autosaveName)
+        if !p.setFrameUsingName(autosaveName) {
+            p.setFrame(defaultRect, display: false)
+        }
         panel = p
-    }
-
-    func windowDidResize(_ notification: Notification) { saveFrame() }
-    func windowDidMove(_ notification: Notification) { saveFrame() }
-
-    private func saveFrame() {
-        guard let f = panel?.frame else { return }
-        UserDefaults.standard.set(NSStringFromRect(f), forKey: frameKey)
     }
 }
 
@@ -82,6 +130,10 @@ final class NotesWindowController: NSObject, NSWindowDelegate {
 
 struct NotesPanelView: View {
     @ObservedObject var model: AppModel
+    let onResizeLayout: (NotesWindowController.LayoutMode) -> Void
+    let onToggleOnTop: () -> Void
+
+    @State private var tab = "notes"
     @State private var searchQuery = ""
     @State private var showSearch = false
     @State private var searchHits: [SearchHit] = []
@@ -104,26 +156,53 @@ struct NotesPanelView: View {
     var body: some View {
         GeometryReader { geo in
             let w = geo.size.width
+            let wide = w >= 680
+            let isCard = w < 350
+
             VStack(spacing: 0) {
-                headerBar(narrow: w < 310)
+                headerBar(wide: wide, isCard: isCard)
+
+                if !wide && !isCard {
+                    HStack(spacing: 4) {
+                        tabPill("纪要", id: "notes")
+                        tabPill(
+                            (activeSession?.lines.isEmpty == false)
+                                ? "文字记录 · \(activeSession?.lines.count ?? 0)"
+                                : "文字记录",
+                            id: "transcript"
+                        )
+                    }
+                    .padding(3)
+                    .background(Color(hex: 0xECEEF2))
+                    .clipShape(RoundedRectangle(cornerRadius: 9))
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 8)
+                    .background(Color.white)
+                }
+
                 if showSearch {
                     searchStrip
                 }
                 if let ask = pendingAsk {
                     askBanner(ask)
                 }
-                Divider().opacity(0.4)
+                Divider().opacity(0.35)
 
-                if w >= 520 {
+                if wide {
                     HStack(spacing: 0) {
                         notesPane(narrow: false)
                             .frame(maxWidth: .infinity)
-                        Divider().opacity(0.4)
+                        Divider().opacity(0.35)
                         transcriptPane
-                            .frame(width: min(max(w * 0.44, 220), 400))
+                            .frame(width: min(max(w * 0.44, 260), 420))
                     }
+                } else if isCard {
+                    cardCompactView
+                } else if tab == "notes" {
+                    notesPane(narrow: false)
+                    liveBottomCaptionBar
                 } else {
-                    notesPane(narrow: w < 310)
+                    transcriptPane
                 }
             }
             .background(Color(hex: 0xF3F4F6))
@@ -131,51 +210,206 @@ struct NotesPanelView: View {
         .onExitCommand { showSearch = false }
     }
 
-    private func headerBar(narrow: Bool) -> some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(model.listening ? Color(hex: 0xE8552B) : Color(hex: 0x9CA3AF))
-                .frame(width: 8, height: 8)
-            Text(activeSession?.displayTitle ?? "尚无活动会议")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Color(hex: 0x15171C))
-                .lineLimit(1)
-            Spacer()
-            if !model.settings.notesCapturable {
-                Label("防截屏", systemImage: "eye.slash")
-                    .labelStyle(.iconOnly)
-                    .font(.caption)
-                    .foregroundStyle(Color(hex: 0x5A5F6B))
-                    .help("当前屏幕共享对对方不可见")
-            }
-            Button {
-                showSearch.toggle()
-            } label: {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12))
-            }
-            .buttonStyle(.borderless)
-            .keyboardShortcut("f", modifiers: .command)
-            .help("在本次记录中搜索 (⌘F)")
+    private func tabPill(_ label: String, id: String) -> some View {
+        let active = tab == id
+        return Button {
+            tab = id
+        } label: {
+            Text(label)
+                .font(.system(size: 12, weight: active ? .semibold : .medium))
+                .foregroundStyle(active ? Color(hex: 0x15171C) : Color(hex: 0x5A5F6B))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 5)
+                .background(active ? Color.white : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+    }
 
-            if let s = activeSession, !s.lines.isEmpty {
+    private func headerBar(wide: Bool, isCard: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(model.listening ? Color(hex: 0xE8552B) : Color(hex: 0x9CA3AF))
+                    .frame(width: 8, height: 8)
+                Text(activeSession?.displayTitle ?? "Verba 实时笔记")
+                    .font(.system(size: isCard ? 13 : 14.5, weight: .bold))
+                    .foregroundStyle(Color(hex: 0x15171C))
+                    .lineLimit(1)
+                Spacer(minLength: 6)
+
                 Button {
-                    Task { await model.generateNotes(sessionId: s.id, fresh: narrow ? false : false) }
+                    model.toggleListening()
                 } label: {
-                    if model.notesLoading {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
+                    Text(model.listening ? "停止" : "开始")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(model.listening ? Color(hex: 0x15171C) : Color(hex: 0xE8552B))
+                        .foregroundStyle(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .help(model.listening ? "停止聆听" : "开始实时字幕与纪要")
+
+                if !isCard {
+                    Button {
+                        showSearch.toggle()
+                    } label: {
+                        Image(systemName: "magnifyingglass")
                             .font(.system(size: 12))
+                            .foregroundStyle(Color(hex: 0x5A5F6B))
                     }
+                    .buttonStyle(.borderless)
+                    .keyboardShortcut("f", modifiers: .command)
+                    .help("会内搜索 (⌘F)")
+                }
+
+                if !isCard {
+                    Button {
+                        onToggleOnTop()
+                    } label: {
+                        Image(systemName: model.notesOnTop ? "pin.fill" : "pin")
+                            .font(.system(size: 12))
+                            .foregroundStyle(model.notesOnTop ? Color(hex: 0xE8552B) : Color(hex: 0x6B7080))
+                    }
+                    .buttonStyle(.borderless)
+                    .help(model.notesOnTop ? "取消置顶" : "窗口置顶")
+                }
+
+                Button {
+                    let next = !model.settings.notesCapturable
+                    Task { await model.updateSettings(["notesCapturable": next]) }
+                } label: {
+                    Image(systemName: model.settings.notesCapturable ? "eye" : "eye.slash")
+                        .font(.system(size: 12))
+                        .foregroundStyle(model.settings.notesCapturable ? Color(hex: 0xE8552B) : Color(hex: 0x6B7080))
                 }
                 .buttonStyle(.borderless)
-                .help("调用本地 Loom 更新纪要")
+                .help(model.settings.notesCapturable ? "屏幕共享对方可见（点击改为防截屏）" : "防截屏隐身中（对方看不到）")
+
+                // Layout preset toggle buttons: Card <-> Sidebar <-> Wide
+                if isCard {
+                    Button {
+                        onResizeLayout(.sidebar)
+                    } label: {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 12))
+                    }
+                    .buttonStyle(.borderless)
+                    .help("展开单栏窗口")
+                } else {
+                    Button {
+                        onResizeLayout(wide ? .sidebar : .wide)
+                    } label: {
+                        Image(systemName: wide ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Color(hex: 0x5A5F6B))
+                    }
+                    .buttonStyle(.borderless)
+                    .help(wide ? "切回单栏" : "展开纪要+原话双栏")
+
+                    Button {
+                        onResizeLayout(.card)
+                    } label: {
+                        Image(systemName: "rectangle.compress.vertical")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Color(hex: 0x5A5F6B))
+                    }
+                    .buttonStyle(.borderless)
+                    .help("收成小卡片")
+                }
+
+                if let s = activeSession, !s.lines.isEmpty && !isCard {
+                    Button {
+                        Task { await model.generateNotes(sessionId: s.id, fresh: false) }
+                    } label: {
+                        if model.notesLoading {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 12))
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .help("立即更新结构化纪要")
+                }
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
+        .padding(.leading, 68) // Leave clean space for macOS traffic-light buttons in transparent titlebar
+        .padding(.trailing, 14)
+        .padding(.top, 10)
+        .padding(.bottom, 10)
         .background(Color.white)
+    }
+
+    private var cardCompactView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let s = activeSession, let notes = s.notes, !notes.isEmpty {
+                        Text(notes.summary)
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(Color(hex: 0x15171C))
+                    } else if let last = activeSession?.lines.last {
+                        Text(last.shown)
+                            .font(.caption)
+                            .foregroundStyle(Color(hex: 0x5A5F6B))
+                        if let dst = last.dst, !dst.isEmpty {
+                            Text(dst)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(Color(hex: 0x15171C))
+                        }
+                    } else {
+                        Text(model.listening ? "正在聆听系统声音…" : "点击右上角「开始」即可开始实时转写与纪要")
+                            .font(.caption)
+                            .foregroundStyle(Color(hex: 0x6B7080))
+                    }
+                }
+                .padding(12)
+            }
+            liveBottomCaptionBar
+        }
+    }
+
+    private var liveBottomCaptionBar: some View {
+        let lastLine = activeSession?.lines.last
+        let draft = model.draft
+        let src = draft?.src ?? lastLine?.shown ?? ""
+        let dst = draft?.dst ?? lastLine?.dst ?? ""
+
+        return Group {
+            if model.listening || !src.isEmpty || !dst.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    if !src.isEmpty {
+                        HStack(spacing: 5) {
+                            if model.listening {
+                                Circle().fill(Color(hex: 0xE8552B)).frame(width: 6, height: 6)
+                            }
+                            Text(src)
+                                .font(.caption)
+                                .foregroundStyle(Color(hex: 0x5A5F6B))
+                                .lineLimit(2)
+                        }
+                    }
+                    if !dst.isEmpty {
+                        Text(dst)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color(hex: 0x15171C))
+                            .lineLimit(2)
+                    } else if model.listening && src.isEmpty {
+                        Text("正在聆听系统音频，说话后这里与字幕浮层会同步显示…")
+                            .font(.caption)
+                            .foregroundStyle(Color(hex: 0x6B7080))
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.white)
+                .overlay(Rectangle().fill(Color.black.opacity(0.06)).frame(height: 1), alignment: .top)
+            }
+        }
     }
 
     private var searchStrip: some View {
@@ -204,6 +438,7 @@ struct NotesPanelView: View {
                         ForEach(searchHits.prefix(6)) { hit in
                             Button {
                                 highlightedLineId = hit.lineId
+                                tab = "transcript"
                             } label: {
                                 HStack(spacing: 4) {
                                     if let t = hit.t {
@@ -282,6 +517,7 @@ struct NotesPanelView: View {
                                 }
                                 if let nearest = s.lines.min(by: { abs($0.t - sec) < abs($1.t - sec) }) {
                                     highlightedLineId = nearest.id
+                                    tab = "transcript"
                                 }
                             }
                         }
@@ -291,7 +527,7 @@ struct NotesPanelView: View {
                         Text(model.listening ? "会议纪要将在发言累积后自动生成" : "还没有纪要")
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(Color(hex: 0x15171C))
-                        Text("Verba 会通过本地 Loom 模型自动整理摘要、议题、鱼骨图、结论、待办与术语表。")
+                        Text("Verba 会通过本地 Loom 自动提炼摘要、议题、鱼骨图、结论、待办与术语表。你也可切换上方「文字记录」查看逐句转写。")
                             .font(.caption)
                             .foregroundStyle(Color(hex: 0x5A5F6B))
                         if let s = activeSession, !s.lines.isEmpty {

@@ -51,8 +51,8 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     // Overlay visibility & mode
     @Published var overlayVisible = false
-    @Published var overlayEditMode = false
     @Published var overlayLastSpeechAt = Date.distantPast
+    @Published var notesOnTop = true
 
     // Synchronized audio playback
     @Published var playingSessionId: String?
@@ -76,7 +76,6 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private var player: AVAudioPlayer?
     private var playbackTimer: Timer?
-    private var overlayHideTimer: Timer?
     private var notesTicker: Task<Void, Never>?
     private var bootStarted = false
 
@@ -85,6 +84,8 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     var onOpenMainWindow: (() -> Void)?
     var onOpenSettingsWindow: (() -> Void)?
     var onOverlayUpdated: (() -> Void)?
+    var onToggleOverlayManual: (() -> Void)?
+    var onEditOverlay: (() -> Void)?
 
     func bootstrap() {
         guard !bootStarted else { return }
@@ -467,35 +468,15 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         if settings.overlayMode != "off" {
             overlayVisible = true
         }
-        scheduleOverlayAutoHide()
-    }
-
-    func scheduleOverlayAutoHide() {
-        overlayHideTimer?.invalidate()
-        guard settings.overlayMode == "auto" else { return }
-        let wait = max(1.5, settings.overlayHideAfter)
-        overlayHideTimer = Timer.scheduledTimer(withTimeInterval: wait, repeats: false) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                if self.settings.overlayMode == "auto" && Date().timeIntervalSince(self.overlayLastSpeechAt) >= wait - 0.1 {
-                    self.overlayVisible = false
-                    self.onOverlayUpdated?()
-                }
-            }
-        }
     }
 
     func toggleOverlayManually() {
-        if overlayVisible {
-            overlayVisible = false
+        if let onToggleOverlayManual {
+            onToggleOverlayManual()
         } else {
-            overlayVisible = true
-            if settings.overlayMode == "auto" {
-                overlayLastSpeechAt = Date()
-                scheduleOverlayAutoHide()
-            }
+            overlayVisible.toggle()
+            onOverlayUpdated?()
         }
-        onOverlayUpdated?()
     }
 
     private func startLiveNotesTicker() {

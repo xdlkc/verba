@@ -492,7 +492,15 @@ struct MainRecordsView: View {
                 Button {
                     model.toggleOverlayManually()
                 } label: {
-                    Label(model.overlayVisible ? "隐藏浮层" : "显示字幕", systemImage: "captions.bubble")
+                    Label(model.overlayVisible ? "收起字幕" : "显示字幕", systemImage: "captions.bubble")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button {
+                    model.onEditOverlay?()
+                } label: {
+                    Label("调整浮层", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)

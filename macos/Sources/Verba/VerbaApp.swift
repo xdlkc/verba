@@ -105,6 +105,9 @@ struct MenuBarPopoverView: View {
                 menuActionRow(title: "切换字幕浮层", shortcut: "⌃⌥S", icon: "captions.bubble") {
                     model.toggleOverlayManually()
                 }
+                menuActionRow(title: "调整字幕位置和大小", shortcut: nil, icon: "arrow.up.and.down.and.arrow.left.and.right") {
+                    model.onEditOverlay?()
+                }
                 menuActionRow(title: "打开实时防截屏笔记窗口", shortcut: nil, icon: "note.text") {
                     model.onOpenNotesWindow?()
                 }
@@ -195,9 +198,17 @@ final class VerbaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
             self?.openSettingsWindow()
         }
         model.onOverlayUpdated = { [weak self] in
-            self?.overlayController.syncVisibility()
+            self?.overlayController.syncFromModel()
             self?.notesController.syncCaptureSetting()
             self?.updateMenuBarIcon()
+        }
+        model.onToggleOverlayManual = { [weak self] in
+            self?.overlayController.toggleManual()
+            self?.updateMenuBarIcon()
+        }
+        model.onEditOverlay = { [weak self] in
+            self?.popover.performClose(nil)
+            self?.overlayController.enterEditMode()
         }
 
         setupMenuBar()
