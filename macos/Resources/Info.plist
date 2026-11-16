@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleDisplayName</key>
+    <string>Verba</string>
+    <key>CFBundleExecutable</key>
+    <string>Verba</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.verba.app</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Verba</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.4</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Verba 需要捕捉系统播放的声音（如在线会议、视频或播客），以完成本地设备端识别和实时翻译。</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Verba 需要访问麦克风，用于识别你的发言及开启现场拾音模式。</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Verba 使用 Apple 设备端语音识别将声音转为文字；原始音频始终保留在本地。</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Verba 需要访问该文件夹以导出会议纪要和字幕文件。</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Verba 需要访问该文件夹以导出或自动同步会议纪要与 Obsidian 笔记。</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Verba 需要访问该文件夹以读取音频或导出会议记录。</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+</dict>
+</plist>

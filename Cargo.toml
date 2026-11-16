@@ -1,0 +1,32 @@
+[package]
+name = "verba"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Verba（言辞）— Local-first bilingual live subtitles and structured meeting notes powered by Rust and local Loom gateway"
+license = "Apache-2.0"
+
+[lib]
+name = "verba"
+path = "src/lib.rs"
+
+[[bin]]
+name = "verba-engine"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+sha2 = "0.11.1"
+regex = "1.13.1"
+futures-util = "0.3"
+async-stream = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
