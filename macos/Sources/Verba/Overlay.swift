@@ -43,68 +43,74 @@ final class GlobalHotkey {
     }
 }
 
-// MARK: - Pure AppKit Floating Subtitle Overlay
+// MARK: - Directly Interactive Floating Subtitle Window
 
 private final class OverlayPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 }
 
 @MainActor
-final class SubtitleOverlayController {
-    enum Pointer: Equatable {
-        case away
-        case passing   // Mouse passing over: faded to 15% and click-through
-        case editing   // Mouse rested 0.45s or requested: outline + corner grip + quick buttons
-    }
-
-    enum Visibility: Equatable {
-        case hidden
-        case open(Pointer)
-        case tucked
-        case peeking
-        case manuallyHidden
-    }
-
+final class SubtitleOverlayController: NSObject, NSWindowDelegate {
     private let model: AppModel
     private let panel: OverlayPanel
     private let view: OverlayView
-    private var hoverTimer: Timer?
+    private var monitorTimer: Timer?
 
-    private(set) var visibility: Visibility = .hidden
+    private var shown = false
+    private var manuallyHidden = false
+    private var collapsed = false
+    private var isLocked = false {
+        didSet {
+            panel.ignoresMouseEvents = isLocked
+            view.isLocked = isLocked
+            if !isLocked { panel.alphaValue = 1.0 }
+            view.needsDisplay = true
+        }
+    }
+
     private var lastContentAt = Date()
-    private var lastMouse = NSPoint.zero
-    private var stillFor: Double = 0
-    private var forcedEditUntilLeave = false
-    private static let pollInterval: Double = 0.05
-
-    private var width: CGFloat = 860
-    private var fontSize: CGFloat = 26
+    private var width: CGFloat = 780
+    private var fontSize: CGFloat = 24
     private var origin = NSPoint.zero
     private var screenKey = ""
-    static let margin: CGFloat = 12
+
+    static let margin: CGFloat = 8
 
     init(model: AppModel) {
         self.model = model
-        self.view = OverlayView(frame: NSRect(x: 0, y: 0, width: 860, height: 140))
+        self.view = OverlayView(frame: NSRect(x: 0, y: 0, width: 780, height: 140))
         self.panel = OverlayPanel(
             contentRect: view.frame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        panel.level = .screenSaver
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        super.init()
+
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = false
-        panel.ignoresMouseEvents = true
+        panel.hasShadow = true
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.ignoresMouseEvents = false // Always interactive by default so drag/click works immediately
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.animationBehavior = .none
-        panel.sharingType = .none // Anti-capture during screen sharing
+        panel.sharingType = .none // Invisible during screen sharing
+        panel.delegate = self
         panel.contentView = view
         view.controller = self
+    }
+
+    // MARK: - NSWindowDelegate
+
+    func windowDidMove(_ notification: Notification) {
+        guard !view.isResizing else { return }
+        let m = Self.margin
+        origin = NSPoint(x: panel.frame.origin.x + m, y: panel.frame.origin.y + m)
+        saveGeometry()
     }
 
     // MARK: - Model Sync
@@ -112,24 +118,14 @@ final class SubtitleOverlayController {
     func syncFromModel() {
         let mode = model.settings.overlayMode
         if mode == "off" {
-            if visibility != .hidden { hide() }
+            hideWindow()
             return
         }
 
-        let hasLiveLines = !(model.liveSession?.lines.isEmpty ?? true)
-        let hasDraft = model.draft != nil
-        let shouldExist = model.listening || model.overlayVisible || mode == "always"
-
-        guard shouldExist else {
-            if visibility != .hidden { hide() }
+        let shouldShowWindow = (model.listening || model.overlayVisible || mode == "always") && !manuallyHidden
+        if !shouldShowWindow {
+            if shown { hideWindow() }
             return
-        }
-
-        if visibility == .hidden {
-            show(startExpanded: model.overlayVisible || mode == "always" || hasLiveLines || hasDraft)
-        } else if visibility == .manuallyHidden && model.overlayVisible {
-            lastContentAt = Date()
-            setExpanded(true, animated: true)
         }
 
         view.listening = model.listening
@@ -137,11 +133,25 @@ final class SubtitleOverlayController {
         view.alert = (model.systemAudioDenied || (model.lastError != nil && !model.lastError!.isEmpty)) ? model.lastError : nil
 
         let (src, dst, isStatus) = buildSubtitleStrings()
-        updateSubtitle(source: src, translation: dst, isStatus: isStatus)
+        let contentChanged = src != view.source || dst != view.translation || isStatus != view.isStatus
+        view.source = src
+        view.translation = dst
+        view.isStatus = isStatus
 
-        if mode != "auto", visibility == .tucked {
+        if !isStatus && contentChanged && (!src.isEmpty || !dst.isEmpty) {
             lastContentAt = Date()
-            expand()
+            if collapsed {
+                setCollapsed(false)
+            }
+        }
+
+        if !shown {
+            restoreGeometry()
+            collapsed = false
+            view.collapsed = false
+            showWindow()
+        } else {
+            layout()
         }
     }
 
@@ -150,110 +160,150 @@ final class SubtitleOverlayController {
         let lastLine = lines.last
         let draft = model.draft
 
-        var srcParts: [String] = []
-        if let l = lastLine {
-            // Only keep previous line if no fresh draft is already showing, or show last finalized + draft concisely
-            if let d = draft, !d.src.isEmpty {
-                srcParts = [d.src]
-            } else {
-                srcParts = [l.shown]
-            }
-        } else if let d = draft, !d.src.isEmpty {
-            srcParts = [d.src]
+        let src: String
+        if let d = draft, !d.src.isEmpty {
+            src = d.src
+        } else if let l = lastLine {
+            src = l.shown
+        } else {
+            src = ""
         }
 
-        var dstParts: [String] = []
+        let dst: String
         if let d = draft, let dd = d.dst, !dd.isEmpty {
-            if let l = lastLine, let ld = l.dst, !ld.isEmpty, d.src.count < 16 {
-                dstParts = [ld, dd]
+            if let l = lastLine, let ld = l.dst, !ld.isEmpty, d.src.count < 14 {
+                dst = "\(ld) \(dd)"
             } else {
-                dstParts = [dd]
+                dst = dd
             }
         } else {
             let recentDst = lines.suffix(2).compactMap { $0.dst }.filter { !$0.isEmpty }
             if !recentDst.isEmpty {
-                dstParts = [recentDst.joined(separator: " ")]
-            } else if let d = draft, !d.src.isEmpty {
-                dstParts = ["翻译中…"]
+                dst = recentDst.joined(separator: " ")
+            } else if !src.isEmpty {
+                dst = "正在翻译…"
+            } else {
+                dst = ""
             }
         }
 
-        let src = srcParts.joined(separator: " ")
-        let dst = dstParts.joined(separator: " ")
-
         if src.isEmpty && dst.isEmpty {
             let hint = model.listening
-                ? "正在聆听系统声音…（鼠标停留 0.5s 可拖动/缩放 · ⌃⌥S 隐藏）"
-                : "字幕浮层已就绪（点击开始聆听 · 双击重置位置）"
+                ? "正在聆听系统声音…（直接按住拖动位置 · 右下角调大小）"
+                : "字幕浮层已就绪（直接拖动调整位置 · 双击恢复居中）"
             return ("", hint, true)
         }
         return (src, dst, false)
     }
 
-    private func updateSubtitle(source: String, translation: String, isStatus: Bool) {
-        let changed = source != view.source || translation != view.translation || isStatus != view.isStatus
-        guard changed else { return }
-
-        view.source = source
-        view.translation = translation
-        view.isStatus = isStatus
-
-        let lines = view.neededLines(barWidth: width)
-        if lines != view.transLines, view.dragMode == nil {
-            view.transLines = lines
-            layout()
-        }
-        view.needsDisplay = true
-
-        if !isStatus && (!source.isEmpty || !translation.isEmpty) {
-            lastContentAt = Date()
-            if visibility == .tucked {
-                expand()
-            }
-        }
-    }
-
     func toggleManual() {
-        if visibility == .hidden {
-            model.overlayVisible = true
-            show(startExpanded: true)
-            syncFromModel()
-            return
-        }
-        if visibility == .manuallyHidden || visibility == .tucked {
+        if !shown || manuallyHidden {
+            manuallyHidden = false
+            isLocked = false
+            collapsed = false
+            view.collapsed = false
             lastContentAt = Date()
             model.overlayVisible = true
-            setExpanded(true, animated: true)
+            syncFromModel()
         } else {
-            setHover(false)
-            visibility = .manuallyHidden
+            manuallyHidden = true
             model.overlayVisible = false
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.18
-                panel.animator().alphaValue = 0
-            }
+            hideWindow()
         }
     }
 
     func enterEditMode() {
-        if visibility == .hidden {
-            model.overlayVisible = true
-            show(startExpanded: true)
-            syncFromModel()
-        } else if visibility == .tucked || visibility == .manuallyHidden {
-            model.overlayVisible = true
-            setExpanded(true, animated: true)
-        }
-        forcedEditUntilLeave = true
+        manuallyHidden = false
+        isLocked = false
+        collapsed = false
+        view.collapsed = false
         lastContentAt = Date()
-        panel.alphaValue = 1
-        setHover(true)
+        model.overlayVisible = true
+        syncFromModel()
+        view.hover = true
+        view.needsDisplay = true
+        panel.alphaValue = 1.0
+        panel.orderFrontRegardless()
     }
 
-    // MARK: - Actions called from OverlayView
+    // MARK: - Window Show / Hide / Collapse
 
-    fileprivate func openNotes() {
-        model.onOpenNotesWindow?()
+    private func showWindow() {
+        shown = true
+        layout()
+        panel.alphaValue = 1.0
+        panel.orderFrontRegardless()
+        startMonitorTimer()
+    }
+
+    private func hideWindow() {
+        shown = false
+        monitorTimer?.invalidate()
+        monitorTimer = nil
+        panel.orderOut(nil)
+    }
+
+    private func setCollapsed(_ on: Bool) {
+        guard collapsed != on else { return }
+        collapsed = on
+        view.collapsed = on
+        if on { view.hover = false }
+        layout()
+        panel.alphaValue = 1.0
+    }
+
+    private func startMonitorTimer() {
+        monitorTimer?.invalidate()
+        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.tick()
+            }
+        }
+        monitorTimer = t
+        RunLoop.main.add(t, forMode: .common)
+    }
+
+    private func tick() {
+        guard shown else { return }
+
+        // If user enabled click-through lock, dim smoothly when cursor passes over
+        if isLocked {
+            let mouse = NSEvent.mouseLocation
+            let over = panel.frame.contains(mouse)
+            let targetAlpha: CGFloat = over ? 0.18 : 1.0
+            if abs(panel.alphaValue - targetAlpha) > 0.05 {
+                panel.alphaValue = targetAlpha
+            }
+        } else if panel.alphaValue < 0.99 {
+            panel.alphaValue = 1.0
+        }
+
+        // Expand pill immediately if collapsed and pointer touches it
+        if collapsed {
+            let mouse = NSEvent.mouseLocation
+            if panel.frame.insetBy(dx: -8, dy: -8).contains(mouse) {
+                lastContentAt = Date()
+                setCollapsed(false)
+            }
+            return
+        }
+
+        // Only tuck away when auto-hide elapsed AND cursor isn't hovering/dragging AND real subtitles have ended
+        if model.settings.overlayMode == "auto",
+           !view.hover,
+           !view.isResizing,
+           !view.isStatus,
+           Date().timeIntervalSince(lastContentAt) > max(3.0, model.settings.overlayHideAfter) {
+            setCollapsed(true)
+        }
+    }
+
+    // MARK: - Actions Triggered by OverlayView
+
+    fileprivate func adjustFont(delta: CGFloat) {
+        fontSize = max(16, min(44, fontSize + delta))
+        layout()
+        saveGeometry()
     }
 
     fileprivate func toggleMic() {
@@ -261,309 +311,132 @@ final class SubtitleOverlayController {
         syncFromModel()
     }
 
-    fileprivate func dismissOrTuck() {
-        setHover(false)
-        if model.settings.overlayMode == "auto" && model.listening {
-            setExpanded(false, animated: true)
-        } else {
-            visibility = .manuallyHidden
-            model.overlayVisible = false
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.18
-                panel.animator().alphaValue = 0
-            }
+    fileprivate func openNotes() {
+        model.onOpenNotesWindow?()
+    }
+
+    fileprivate func enableLockClickThrough() {
+        isLocked = true
+    }
+
+    fileprivate func closeFromBar() {
+        manuallyHidden = true
+        model.overlayVisible = false
+        hideWindow()
+    }
+
+    fileprivate func pointerEnteredBar() {
+        lastContentAt = Date()
+        if collapsed {
+            setCollapsed(false)
         }
     }
 
-    // MARK: - Show / Hide
-
-    private func show(startExpanded: Bool) {
-        restore()
-        setExpanded(startExpanded, animated: false)
-        layout()
-        panel.alphaValue = 1
-        panel.orderFrontRegardless()
-        startHoverPoll()
-    }
-
-    private func hide() {
-        visibility = .hidden
-        hoverTimer?.invalidate()
-        hoverTimer = nil
-        forcedEditUntilLeave = false
-        setHover(false)
-        panel.orderOut(nil)
-    }
-
-    private func startHoverPoll() {
-        hoverTimer?.invalidate()
-        let t = Timer(timeInterval: Self.pollInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.pollHover()
-            }
-        }
-        hoverTimer = t
-        RunLoop.main.add(t, forMode: .common)
-    }
-
-    private func expand() {
-        guard visibility != .hidden, visibility != .manuallyHidden else { return }
-        if visibility == .tucked {
-            setExpanded(true, animated: true)
-        }
-    }
-
-    private func setExpanded(_ on: Bool, animated: Bool) {
-        if !on {
-            stillFor = 0
-            forcedEditUntilLeave = false
-            setHover(false)
-        }
-        visibility = on ? .open(.away) : .tucked
-
-        if !animated {
-            view.collapsed = !on
-            view.needsDisplay = true
-            panel.alphaValue = 1
-            return
-        }
-
-        if on {
-            view.collapsed = false
-            view.needsDisplay = true
-            panel.alphaValue = 0
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.18
-                panel.animator().alphaValue = 1
-            }
-        } else {
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.28
-                panel.animator().alphaValue = 0
-            }, completionHandler: { [weak self] in
-                Task { @MainActor [weak self] in
-                    guard let self, self.visibility == .tucked else { return }
-                    self.view.collapsed = true
-                    self.view.needsDisplay = true
-                    NSAnimationContext.runAnimationGroup { ctx in
-                        ctx.duration = 0.18
-                        self.panel.animator().alphaValue = 1
-                    }
-                }
-            })
-        }
-    }
-
-    // MARK: - Geometry & Per-Display Persistence
-
-    private var barHeight: CGFloat { view.barHeight(fontSize: fontSize) }
-    var barFrame: NSRect { NSRect(x: origin.x, y: origin.y, width: width, height: barHeight) }
-    private var pillFrame: NSRect { NSRect(x: origin.x + width / 2 - 36, y: origin.y - 6, width: 72, height: 32) }
+    // MARK: - Geometry & Per-Screen Persistence
 
     private func layout() {
         view.fontSize = fontSize
         let m = Self.margin
-        let frame = NSRect(x: origin.x - m, y: origin.y - m, width: width + 2 * m, height: barHeight + 2 * m)
-        panel.setFrame(frame, display: true)
+
+        if collapsed {
+            let pillW: CGFloat = 144
+            let pillH: CGFloat = 28
+            let x = origin.x + width / 2 - pillW / 2
+            let y = origin.y
+            panel.setFrame(NSRect(x: x - m, y: y - m, width: pillW + 2 * m, height: pillH + 2 * m), display: true)
+            view.needsDisplay = true
+            return
+        }
+
+        view.transLines = view.neededLines(barWidth: width)
+        let h = view.barHeight(fontSize: fontSize)
+        panel.setFrame(NSRect(x: origin.x - m, y: origin.y - m, width: width + 2 * m, height: h + 2 * m), display: true)
         view.needsDisplay = true
     }
 
     private func currentScreen() -> NSScreen {
-        let mid = NSPoint(x: origin.x + width / 2, y: origin.y + 10)
+        let mid = NSPoint(x: origin.x + width / 2, y: origin.y + 20)
         return NSScreen.screens.first { $0.frame.contains(mid) } ?? NSScreen.main ?? NSScreen.screens[0]
     }
 
     private static func key(for screen: NSScreen) -> String {
         let n = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.intValue ?? 0
-        return "verba.overlay.\(n)"
+        return "verba.overlay2.\(n)"
     }
 
     private func defaults(on screen: NSScreen) {
         let v = screen.visibleFrame
-        width = min(940, max(540, v.width - 180))
-        fontSize = 26
+        width = min(840, max(520, v.width - 200))
+        fontSize = 24
         origin = NSPoint(x: v.midX - width / 2, y: v.minY + 52)
     }
 
-    private func restore() {
+    private func restoreGeometry() {
         let d = UserDefaults.standard
-        let last = d.string(forKey: "verba.overlay.lastScreen")
+        let last = d.string(forKey: "verba.overlay2.lastScreen")
         let screen = NSScreen.screens.first { Self.key(for: $0) == last }
             ?? NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) }
             ?? NSScreen.main ?? NSScreen.screens[0]
         screenKey = Self.key(for: screen)
         if let a = d.array(forKey: screenKey) as? [Double], a.count == 4 {
-            let rect = NSRect(x: a[0], y: a[1], width: a[2], height: 40)
+            let rect = NSRect(x: a[0], y: a[1], width: a[2], height: 60)
             if screen.frame.intersects(rect) {
                 origin = NSPoint(x: a[0], y: a[1])
-                width = max(420, min(1800, a[2]))
-                fontSize = max(18, min(48, a[3]))
+                width = max(420, min(1600, a[2]))
+                fontSize = max(16, min(44, a[3]))
                 return
             }
         }
         defaults(on: screen)
     }
 
-    private func save() {
+    fileprivate func saveGeometry() {
         let screen = currentScreen()
         screenKey = Self.key(for: screen)
         UserDefaults.standard.set([Double(origin.x), Double(origin.y), Double(width), Double(fontSize)], forKey: screenKey)
-        UserDefaults.standard.set(screenKey, forKey: "verba.overlay.lastScreen")
+        UserDefaults.standard.set(screenKey, forKey: "verba.overlay2.lastScreen")
     }
 
     fileprivate func resetPosition() {
         defaults(on: currentScreen())
         layout()
-        save()
+        saveGeometry()
     }
 
-    // MARK: - Hover State Machine (50ms Common RunLoop Polling)
+    // MARK: - Bottom-Right Corner Resize (Keeps Top Edge & Left Edge Pinned)
 
-    private var dimmed: Bool { visibility == .open(.passing) }
-    private var expanded: Bool {
-        switch visibility {
-        case .open, .peeking, .manuallyHidden: true
-        case .hidden, .tucked: false
-        }
+    private var resizeStartMouse = NSPoint.zero
+    private var resizeStartWidth: CGFloat = 0
+    private var resizeStartFont: CGFloat = 0
+    private var resizeStartTop: CGFloat = 0
+
+    fileprivate func beginResize() {
+        resizeStartMouse = NSEvent.mouseLocation
+        resizeStartWidth = width
+        resizeStartFont = fontSize
+        resizeStartTop = origin.y + view.barHeight(fontSize: fontSize)
     }
 
-    private func setDimmed(_ on: Bool) {
-        guard dimmed != on, case .open = visibility else { return }
-        visibility = .open(on ? .passing : .away)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = on ? 0.12 : 0.22
-            panel.animator().alphaValue = on ? 0.15 : 1.0
-        }
-    }
-
-    private func pollHover() {
-        guard visibility != .hidden, visibility != .manuallyHidden, view.dragMode == nil else { return }
-        let mouse = NSEvent.mouseLocation
-        let moved = hypot(mouse.x - lastMouse.x, mouse.y - lastMouse.y) > 2
-        lastMouse = mouse
-
-        // Tucked away: hover the pill to peek at the latest subtitle
-        if !expanded {
-            if pillFrame.contains(mouse) {
-                setExpanded(true, animated: true)
-                visibility = .peeking
-            }
-            return
-        }
-
-        let overBar = barFrame.insetBy(dx: -6, dy: -6).contains(mouse)
-        if visibility == .open(.editing) {
-            if forcedEditUntilLeave {
-                if overBar { forcedEditUntilLeave = false }
-                return
-            }
-            if !overBar {
-                setHover(false)
-                stillFor = 0
-            }
-            return
-        }
-
-        if visibility == .peeking {
-            if !overBar && !pillFrame.contains(mouse) {
-                if model.settings.overlayMode == "auto" {
-                    setExpanded(false, animated: true)
-                } else {
-                    visibility = .open(.away)
-                }
-            }
-            return
-        }
-
-        if overBar {
-            setDimmed(true)
-            stillFor = moved ? 0 : stillFor + Self.pollInterval
-            if stillFor >= 0.45 {
-                setDimmed(false)
-                setHover(true)
-            }
-        } else {
-            stillFor = 0
-            setDimmed(false)
-        }
-
-        if model.settings.overlayMode == "auto",
-           visibility == .open(.away),
-           !view.isStatus,
-           Date().timeIntervalSince(lastContentAt) > max(2.0, model.settings.overlayHideAfter) {
-            setExpanded(false, animated: true)
-        }
-    }
-
-    private func setHover(_ on: Bool) {
-        if case .open = visibility {
-            visibility = .open(on ? .editing : .away)
-        }
-        view.hover = on
-        panel.ignoresMouseEvents = !on
-        view.needsDisplay = true
-    }
-
-    // MARK: - Smooth Screen-Space Drag & Scale
-
-    private var dragStartMouse = NSPoint.zero
-    private var dragStartOrigin = NSPoint.zero
-    private var dragStartWidth: CGFloat = 0
-    private var dragStartFont: CGFloat = 0
-    private var snapped = false
-
-    fileprivate func beginDrag() {
-        dragStartMouse = NSEvent.mouseLocation
-        dragStartOrigin = origin
-        dragStartWidth = width
-        dragStartFont = fontSize
-        snapped = false
-    }
-
-    fileprivate func drag(scale: Bool) {
+    fileprivate func updateResize() {
         let p = NSEvent.mouseLocation
-        let dx = p.x - dragStartMouse.x
-        let dy = p.y - dragStartMouse.y
+        let dx = p.x - resizeStartMouse.x
         let screen = currentScreen()
-        let sf = screen.frame
-
-        if scale {
-            let maxW = min(1800, sf.width - 24)
-            width = max(420, min(maxW, dragStartWidth + dx))
-            fontSize = max(18, min(48, (dragStartFont * width / dragStartWidth).rounded()))
-            let oldTop = dragStartOrigin.y + view.barHeight(fontSize: dragStartFont)
-            origin = NSPoint(x: dragStartOrigin.x, y: oldTop - view.barHeight(fontSize: fontSize))
-        } else {
-            var x = dragStartOrigin.x + dx
-            let y = dragStartOrigin.y + dy
-            let center = screen.visibleFrame.midX
-            if abs(x + width / 2 - center) < 18 {
-                x = center - width / 2
-                if !snapped {
-                    NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
-                }
-                snapped = true
-            } else {
-                snapped = false
-            }
-            origin = NSPoint(x: x, y: y)
-        }
-
-        let all = NSScreen.screens.reduce(NSRect.null) { $0.union($1.frame) }
-        origin.x = max(all.minX + 4 - width + 120, min(all.maxX - 120, origin.x))
-        origin.y = max(all.minY + 4, min(all.maxY - barHeight - 4, origin.y))
-        view.snapped = snapped && !scale
+        let maxW = min(1600, screen.visibleFrame.width - 32)
+        let newW = max(420, min(maxW, resizeStartWidth + dx))
+        width = newW
+        fontSize = max(16, min(44, (resizeStartFont * newW / resizeStartWidth).rounded()))
+        view.transLines = view.neededLines(barWidth: width)
+        let newH = view.barHeight(fontSize: fontSize)
+        origin.y = max(screen.visibleFrame.minY + 8, resizeStartTop - newH)
         layout()
     }
 
-    fileprivate func endDrag() {
-        view.snapped = false
-        save()
-        view.needsDisplay = true
+    fileprivate func endResize() {
+        saveGeometry()
     }
 }
 
-// MARK: - AppKit Custom-Drawn View
+// MARK: - Custom-Drawn View with Instant Hover Toolbar & Native Drag
 
 private final class OverlayView: NSView {
     weak var controller: SubtitleOverlayController?
@@ -572,98 +445,172 @@ private final class OverlayView: NSView {
     var translation = ""
     var isStatus = false
     var alert: String?
-    var fontSize: CGFloat = 26
+    var fontSize: CGFloat = 24
     var hover = false
-    var snapped = false
     var collapsed = false
+    var isLocked = false
+    var isResizing = false
     var transLines = 1
-    var dragMode: Bool?
     var micOn = false
     var listening = false
 
+    private var trackingArea: NSTrackingArea?
     private let accent = NSColor(srgbRed: 0.91, green: 0.33, blue: 0.17, alpha: 1)
 
     override var isFlipped: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    private func k(_ fs: CGFloat) -> CGFloat { fs / 28 }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hover = true
+        controller?.pointerEnteredBar()
+        needsDisplay = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if !isResizing {
+            hover = false
+            needsDisplay = true
+        }
+    }
+
+    // Metrics
+    private var topToolbarHeight: CGFloat { 26 }
+    private func k(_ fs: CGFloat) -> CGFloat { fs / 24 }
     private func srcFont(_ fs: CGFloat) -> NSFont { .systemFont(ofSize: max(12, fs * 0.56), weight: .medium) }
     private func transFont(_ fs: CGFloat) -> NSFont { .systemFont(ofSize: fs, weight: .semibold) }
-    private func alertFont(_ fs: CGFloat) -> NSFont { .systemFont(ofSize: max(11, fs * 0.45), weight: .semibold) }
-    private func line(_ f: NSFont) -> CGFloat { ceil(f.ascender - f.descender + f.leading) * 1.18 }
-    private func alertHeight(_ fs: CGFloat) -> CGFloat { ceil(line(alertFont(fs)) + 6 * k(fs)) }
+    private func alertFont(_ fs: CGFloat) -> NSFont { .systemFont(ofSize: max(11, fs * 0.48), weight: .semibold) }
+    private func lineHeight(_ f: NSFont) -> CGFloat { ceil(f.ascender - f.descender + f.leading) * 1.18 }
+    private func alertHeight(_ fs: CGFloat) -> CGFloat { ceil(lineHeight(alertFont(fs)) + 6 * k(fs)) }
 
     func barHeight(fontSize fs: CGFloat) -> CGFloat {
-        let pad = 14 * k(fs)
-        var h = pad * 2 + line(srcFont(fs)) + 6 * k(fs) + line(transFont(fs)) * CGFloat(transLines)
-        if alert != nil { h += alertHeight(fs) + 8 * k(fs) }
-        return ceil(h)
+        let bottomPad = 12 * k(fs)
+        let topPad = topToolbarHeight + 6
+        var h = topPad + bottomPad + lineHeight(srcFont(fs)) + 5 * k(fs) + lineHeight(transFont(fs)) * CGFloat(transLines)
+        if alert != nil { h += alertHeight(fs) + 6 * k(fs) }
+        return ceil(max(96, h))
     }
 
     private var barRect: NSRect { bounds.insetBy(dx: SubtitleOverlayController.margin, dy: SubtitleOverlayController.margin) }
 
+    // Hit Rects for Toolbar Buttons (inside top bar strip, right-aligned)
+    private var closeBtnRect: NSRect {
+        NSRect(x: barRect.maxX - 30, y: barRect.maxY - 26, width: 22, height: 20)
+    }
+    private var lockBtnRect: NSRect {
+        NSRect(x: closeBtnRect.minX - 52, y: barRect.maxY - 26, width: 48, height: 20)
+    }
+    private var notesBtnRect: NSRect {
+        NSRect(x: lockBtnRect.minX - 46, y: barRect.maxY - 26, width: 42, height: 20)
+    }
+    private var micBtnRect: NSRect {
+        NSRect(x: notesBtnRect.minX - 28, y: barRect.maxY - 26, width: 24, height: 20)
+    }
+    private var fontPlusRect: NSRect {
+        NSRect(x: micBtnRect.minX - 30, y: barRect.maxY - 26, width: 26, height: 20)
+    }
+    private var fontMinusRect: NSRect {
+        NSRect(x: fontPlusRect.minX - 28, y: barRect.maxY - 26, width: 26, height: 20)
+    }
+
     private var gripRect: NSRect {
-        let s: CGFloat = 26
-        return NSRect(x: barRect.maxX - s + 6, y: barRect.minY - 6, width: s, height: s)
-    }
-
-    private var micRect: NSRect {
-        let s: CGFloat = 26
-        return NSRect(x: barRect.minX - 6, y: barRect.minY - 6, width: s + 4, height: s)
-    }
-
-    private var notesRect: NSRect {
-        let s: CGFloat = 26
-        return NSRect(x: micRect.maxX + 6, y: barRect.minY - 6, width: s + 4, height: s)
-    }
-
-    private var closeRect: NSRect {
-        let s: CGFloat = 26
-        return NSRect(x: barRect.maxX - s + 6, y: barRect.maxY - s + 6, width: s, height: s)
+        NSRect(x: barRect.maxX - 24, y: barRect.minY + 2, width: 22, height: 22)
     }
 
     override func draw(_ dirtyRect: NSRect) {
         if collapsed {
-            let pill = NSRect(x: barRect.midX - 24, y: barRect.minY, width: 48, height: 18)
-            NSColor(calibratedWhite: 0.06, alpha: 0.78).setFill()
-            NSBezierPath(roundedRect: pill, xRadius: 9, yRadius: 9).fill()
-            (listening ? accent : NSColor.white.withAlphaComponent(0.6)).setFill()
-            NSBezierPath(ovalIn: NSRect(x: pill.minX + 12, y: pill.midY - 2.5, width: 5, height: 5)).fill()
-            NSColor.white.withAlphaComponent(0.45).setFill()
-            NSBezierPath(ovalIn: NSRect(x: pill.minX + 21.5, y: pill.midY - 1.5, width: 3, height: 3)).fill()
-            NSBezierPath(ovalIn: NSRect(x: pill.minX + 29, y: pill.midY - 1.5, width: 3, height: 3)).fill()
+            let pill = barRect
+            NSColor(srgbRed: 0.08, green: 0.09, blue: 0.12, alpha: 0.88).setFill()
+            NSBezierPath(roundedRect: pill, xRadius: pill.height / 2, yRadius: pill.height / 2).fill()
+            NSColor.white.withAlphaComponent(0.18).setStroke()
+            let border = NSBezierPath(roundedRect: pill, xRadius: pill.height / 2, yRadius: pill.height / 2)
+            border.lineWidth = 0.8
+            border.stroke()
+
+            (listening ? accent : NSColor.systemGray).setFill()
+            NSBezierPath(ovalIn: NSRect(x: pill.minX + 12, y: pill.midY - 3.5, width: 7, height: 7)).fill()
+
+            let label = listening ? "正在聆听 · 悬停展开" : "字幕已收起"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.88),
+            ]
+            let sz = (label as NSString).size(withAttributes: attrs)
+            (label as NSString).draw(at: NSPoint(x: pill.minX + 25, y: pill.midY - sz.height / 2), withAttributes: attrs)
             return
         }
 
         let bar = barRect
-        let radius = 16 * k(fontSize)
-        NSColor(srgbRed: 0.06, green: 0.07, blue: 0.09, alpha: 0.90).setFill()
+        let radius: CGFloat = 14
+        NSColor(srgbRed: 0.06, green: 0.07, blue: 0.095, alpha: 0.90).setFill()
         NSBezierPath(roundedRect: bar, xRadius: radius, yRadius: radius).fill()
 
-        if hover {
-            let outline = NSBezierPath(roundedRect: bar.insetBy(dx: -2.5, dy: -2.5), xRadius: radius + 2.5, yRadius: radius + 2.5)
-            outline.lineWidth = 1.5
-            (snapped ? accent : NSColor.white.withAlphaComponent(0.55)).setStroke()
-            outline.stroke()
-        } else {
-            let hairline = NSBezierPath(roundedRect: bar, xRadius: radius, yRadius: radius)
-            hairline.lineWidth = 0.8
-            NSColor.white.withAlphaComponent(0.12).setStroke()
-            hairline.stroke()
+        let border = NSBezierPath(roundedRect: bar, xRadius: radius, yRadius: radius)
+        border.lineWidth = hover ? 1.4 : 0.8
+        (hover ? accent.withAlphaComponent(0.85) : NSColor.white.withAlphaComponent(0.16)).setStroke()
+        border.stroke()
+
+        // Top toolbar controls (always crisp and immediately clickable on hover)
+        if hover && !isLocked {
+            let hintAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.60),
+            ]
+            let dotColor = listening ? accent : NSColor.white.withAlphaComponent(0.45)
+            dotColor.setFill()
+            NSBezierPath(ovalIn: NSRect(x: bar.minX + 12, y: bar.maxY - 19, width: 6, height: 6)).fill()
+            ("按住任意空白处拖动 · 双击复位" as NSString).draw(at: NSPoint(x: bar.minX + 23, y: bar.maxY - 22), withAttributes: hintAttrs)
+
+            drawToolText(fontMinusRect, title: "A-", active: false)
+            drawToolText(fontPlusRect, title: "A+", active: false)
+            drawToolSymbol(micBtnRect, symbol: micOn ? "mic.fill" : "mic", active: micOn)
+            drawToolText(notesBtnRect, title: "笔记", active: false)
+            drawToolText(lockBtnRect, title: "穿透", active: false)
+            drawToolSymbol(closeBtnRect, symbol: "xmark", active: false)
+
+            // Bottom-right corner resize grip lines
+            let g = gripRect
+            let p = NSBezierPath()
+            p.lineWidth = 1.6
+            p.lineCapStyle = .round
+            p.move(to: NSPoint(x: g.minX + 6, y: g.minY + 4))
+            p.line(to: NSPoint(x: g.maxX - 4, y: g.maxY - 6))
+            p.move(to: NSPoint(x: g.midX + 1, y: g.minY + 4))
+            p.line(to: NSPoint(x: g.maxX - 4, y: g.midY - 1))
+            NSColor.white.withAlphaComponent(0.65).setStroke()
+            p.stroke()
         }
 
+        // Subtitle Text
         let fs = fontSize
-        let pad = 14 * k(fs)
-        let inner = bar.insetBy(dx: 28 * k(fs), dy: pad)
+        let padX = 24 * k(fs)
+        let inner = NSRect(
+            x: bar.minX + padX,
+            y: bar.minY + 10 * k(fs),
+            width: max(60, bar.width - 2 * padX),
+            height: max(20, bar.height - topToolbarHeight - 14 * k(fs))
+        )
         var y = inner.maxY
 
         let center = NSMutableParagraphStyle()
         center.alignment = .center
         center.lineBreakMode = .byWordWrapping
 
-        func drawText(_ text: String, font: NSFont, color: NSColor, maxLines: Int) {
+        func drawSub(_ text: String, font: NSFont, color: NSColor, maxLines: Int) {
             let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color, .paragraphStyle: center]
-            let maxH = line(font) * CGFloat(maxLines)
+            let maxH = lineHeight(font) * CGFloat(maxLines)
             let fitted = fitTail(text, attrs: attrs, width: inner.width, maxHeight: maxH + 1)
             let h = min(maxH, height(of: fitted, attrs: attrs, width: inner.width))
             let rect = NSRect(x: inner.minX, y: y - maxH, width: inner.width, height: h)
@@ -676,51 +623,41 @@ private final class OverlayView: NSView {
             let attrs: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: NSColor.white]
             let sz = (alert as NSString).size(withAttributes: attrs)
             let h = alertHeight(fs)
-            let w = min(inner.width, ceil(sz.width) + 24 * k(fs))
+            let w = min(inner.width, ceil(sz.width) + 22 * k(fs))
             let pill = NSRect(x: inner.midX - w / 2, y: y - h, width: w, height: h)
             accent.setFill()
             NSBezierPath(roundedRect: pill, xRadius: h / 2, yRadius: h / 2).fill()
-            (alert as NSString).draw(at: NSPoint(x: pill.midX - min(sz.width, w - 12) / 2, y: pill.midY - sz.height / 2), withAttributes: attrs)
-            y -= h + 8 * k(fs)
+            (alert as NSString).draw(at: NSPoint(x: pill.midX - min(sz.width, w - 10) / 2, y: pill.midY - sz.height / 2), withAttributes: attrs)
+            y -= h + 6 * k(fs)
         }
 
         let srcText = isStatus ? "" : source
-        drawText(srcText, font: srcFont(fs), color: NSColor.white.withAlphaComponent(0.64), maxLines: 1)
-        y -= 6 * k(fs)
-        drawText(
+        drawSub(srcText, font: srcFont(fs), color: NSColor.white.withAlphaComponent(0.65), maxLines: 1)
+        y -= 4 * k(fs)
+        drawSub(
             translation,
             font: transFont(fs),
-            color: isStatus ? NSColor.white.withAlphaComponent(0.75) : .white,
+            color: isStatus ? NSColor.white.withAlphaComponent(0.78) : .white,
             maxLines: transLines
         )
-
-        if hover {
-            drawCornerButton(micRect, symbol: micOn ? "mic.fill" : "mic", active: micOn)
-            drawCornerButton(notesRect, symbol: "note.text", active: false)
-            drawCornerButton(closeRect, symbol: "xmark", active: false)
-
-            // Bottom-right proportional resize grip
-            let g = gripRect
-            NSColor(calibratedWhite: 0.94, alpha: 1).setFill()
-            NSBezierPath(roundedRect: g, xRadius: 8, yRadius: 8).fill()
-            let path = NSBezierPath()
-            path.lineWidth = 2
-            path.lineCapStyle = .round
-            path.move(to: NSPoint(x: g.minX + 8, y: g.minY + 7))
-            path.line(to: NSPoint(x: g.maxX - 7, y: g.maxY - 8))
-            path.move(to: NSPoint(x: g.midX + 1, y: g.minY + 7))
-            path.line(to: NSPoint(x: g.maxX - 7, y: g.midY - 1))
-            NSColor(calibratedWhite: 0.1, alpha: 1).setStroke()
-            path.stroke()
-        }
     }
 
-    private func drawCornerButton(_ rect: NSRect, symbol: String, active: Bool) {
-        let bg = active ? NSColor(srgbRed: 0.99, green: 0.93, blue: 0.906, alpha: 1) : NSColor(calibratedWhite: 0.94, alpha: 1)
-        bg.setFill()
-        NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8).fill()
-        let fg = active ? accent : NSColor(calibratedWhite: 0.1, alpha: 1)
-        let cfg = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold).applying(.init(paletteColors: [fg]))
+    private func drawToolText(_ rect: NSRect, title: String, active: Bool) {
+        (active ? accent : NSColor.white.withAlphaComponent(0.14)).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.92),
+        ]
+        let sz = (title as NSString).size(withAttributes: attrs)
+        (title as NSString).draw(at: NSPoint(x: rect.midX - sz.width / 2, y: rect.midY - sz.height / 2), withAttributes: attrs)
+    }
+
+    private func drawToolSymbol(_ rect: NSRect, symbol: String, active: Bool) {
+        (active ? accent : NSColor.white.withAlphaComponent(0.14)).setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
+        let cfg = NSImage.SymbolConfiguration(pointSize: 10.5, weight: .semibold)
+            .applying(.init(paletteColors: [NSColor.white]))
         if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
             img.draw(in: NSRect(
                 x: rect.midX - img.size.width / 2,
@@ -734,8 +671,8 @@ private final class OverlayView: NSView {
     func neededLines(barWidth: CGFloat) -> Int {
         let fs = fontSize
         let attrs: [NSAttributedString.Key: Any] = [.font: transFont(fs)]
-        let w = barWidth - 56 * k(fs)
-        return height(of: translation, attrs: attrs, width: w) > line(transFont(fs)) * 1.3 ? 2 : 1
+        let w = max(60, barWidth - 48 * k(fs))
+        return height(of: translation, attrs: attrs, width: w) > lineHeight(transFont(fs)) * 1.3 ? 2 : 1
     }
 
     private func height(of s: String, attrs: [NSAttributedString.Key: Any], width: CGFloat) -> CGFloat {
@@ -762,50 +699,83 @@ private final class OverlayView: NSView {
         return "…" + String(chars[min(lo, chars.count)...])
     }
 
-    // MARK: - Mouse Dragging & Resizing
+    // MARK: - Direct Mouse Down / Native OS Window Drag / Resize
 
     override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+
+        if collapsed {
+            controller?.pointerEnteredBar()
+            window?.performDrag(with: event)
+            return
+        }
+
+        if hover && fontMinusRect.contains(p) {
+            controller?.adjustFont(delta: -2)
+            return
+        }
+        if hover && fontPlusRect.contains(p) {
+            controller?.adjustFont(delta: 2)
+            return
+        }
+        if hover && micBtnRect.contains(p) {
+            controller?.toggleMic()
+            return
+        }
+        if hover && notesBtnRect.contains(p) {
+            controller?.openNotes()
+            return
+        }
+        if hover && lockBtnRect.contains(p) {
+            controller?.enableLockClickThrough()
+            return
+        }
+        if hover && closeBtnRect.contains(p) {
+            controller?.closeFromBar()
+            return
+        }
+
+        if gripRect.insetBy(dx: -8, dy: -8).contains(p) {
+            isResizing = true
+            controller?.beginResize()
+            NSCursor.crosshair.push()
+            return
+        }
+
         if event.clickCount == 2 {
             controller?.resetPosition()
             return
         }
-        let p = convert(event.locationInWindow, from: nil)
-        if hover && micRect.insetBy(dx: -4, dy: -4).contains(p) {
-            controller?.toggleMic()
-            return
-        }
-        if hover && notesRect.insetBy(dx: -4, dy: -4).contains(p) {
-            controller?.openNotes()
-            return
-        }
-        if hover && closeRect.insetBy(dx: -4, dy: -4).contains(p) {
-            controller?.dismissOrTuck()
-            return
-        }
-        dragMode = gripRect.insetBy(dx: -6, dy: -6).contains(p)
-        controller?.beginDrag()
-        (dragMode == true ? NSCursor.crosshair : NSCursor.closedHand).push()
+
+        // Let macOS WindowServer drag the borderless window smoothly with 0 jitter
+        window?.performDrag(with: event)
+        controller?.saveGeometry()
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let mode = dragMode else { return }
-        controller?.drag(scale: mode)
+        if isResizing {
+            controller?.updateResize()
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard dragMode != nil else { return }
-        dragMode = nil
-        NSCursor.pop()
-        controller?.endDrag()
+        if isResizing {
+            isResizing = false
+            NSCursor.pop()
+            controller?.endResize()
+        }
     }
 
     override func resetCursorRects() {
-        if hover {
-            addCursorRect(barRect, cursor: .openHand)
-            addCursorRect(gripRect, cursor: .crosshair)
-            addCursorRect(micRect, cursor: .pointingHand)
-            addCursorRect(notesRect, cursor: .pointingHand)
-            addCursorRect(closeRect, cursor: .pointingHand)
+        addCursorRect(barRect, cursor: .openHand)
+        if hover && !isLocked {
+            addCursorRect(gripRect.insetBy(dx: -4, dy: -4), cursor: .crosshair)
+            addCursorRect(fontMinusRect, cursor: .pointingHand)
+            addCursorRect(fontPlusRect, cursor: .pointingHand)
+            addCursorRect(micBtnRect, cursor: .pointingHand)
+            addCursorRect(notesBtnRect, cursor: .pointingHand)
+            addCursorRect(lockBtnRect, cursor: .pointingHand)
+            addCursorRect(closeBtnRect, cursor: .pointingHand)
         }
     }
 }
