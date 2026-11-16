@@ -198,6 +198,9 @@ final class VerbaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
         }
 
         model.bootstrap()
+        if !CommandLine.arguments.contains("--background") {
+            openMainWindow()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -295,9 +298,12 @@ final class VerbaAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate 
 
 @main
 struct VerbaMain {
+    private static var sharedDelegate: VerbaAppDelegate?
+
     static func main() {
         let app = NSApplication.shared
         let delegate = VerbaAppDelegate()
+        sharedDelegate = delegate
         app.delegate = delegate
         app.run()
     }
