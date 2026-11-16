@@ -1,7 +1,6 @@
 import AVFoundation
 import CoreMedia
 import Foundation
-import NaturalLanguage
 import Speech
 
 struct LanguageOption: Identifiable, Hashable {
@@ -255,6 +254,29 @@ private func convertBuffer(
     return out
 }
 
+private func copyPCMBuffer(_ input: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    guard input.frameLength > 0,
+          let copy = AVAudioPCMBuffer(pcmFormat: input.format, frameCapacity: input.frameLength) else {
+        return nil
+    }
+    copy.frameLength = input.frameLength
+    let channels = Int(input.format.channelCount)
+    let frames = Int(input.frameLength)
+    if let src = input.floatChannelData, let dst = copy.floatChannelData {
+        for ch in 0..<channels {
+            memcpy(dst[ch], src[ch], frames * MemoryLayout<Float>.size)
+        }
+        return copy
+    }
+    if let src = input.int16ChannelData, let dst = copy.int16ChannelData {
+        for ch in 0..<channels {
+            memcpy(dst[ch], src[ch], frames * MemoryLayout<Int16>.size)
+        }
+        return copy
+    }
+    return nil
+}
+
 // MARK: - macOS 26 SpeechAnalyzer Implementation
 
 @available(macOS 26, *)
@@ -268,10 +290,15 @@ private final class ModernAnalyzerStream {
     private var converter: AVAudioConverter?
     private var readerTask: Task<Void, Never>?
     private var cutTask: Task<Void, Never>?
+    private var pendingBuffers: [AVAudioPCMBuffer] = []
+    private var pendingFrames: AVAudioFrameCount = 0
     private var fedSeconds: Double = 0
     private var lastCutThrough: Double = 0
+    private var lastResultEnd: Double = 0
     private var lastVolatile = ""
     private var lastVolatileAt = Date.distantPast
+    private var lastCutDraft = ""
+    private var lastCutAt = Date.distantPast
     private var cutting = false
     private var stopped = false
 
@@ -296,25 +323,61 @@ private final class ModernAnalyzerStream {
         }
         let targetLang = lock.withLock { langCode }
         Task { [weak self] in
-            await self?.openSession(generation: gen, langCode: targetLang, replaySamples: replaySamples)
+            await self?.openSession(
+                generation: gen,
+                langCode: targetLang,
+                replaySamples: replaySamples,
+                allowDownload: true
+            )
         }
     }
 
     func switchLanguage(to newCode: String, replaySamples: [Float]) {
-        let gen = lock.withLock { () -> Int in
-            langCode = newCode
-            generation += 1
-            return generation
-        }
+        let currentLang = lock.withLock { langCode }
+        guard newCode != currentLang else { return }
         Task { [weak self] in
-            await self?.teardownCurrent()
-            await self?.openSession(generation: gen, langCode: newCode, replaySamples: replaySamples)
+            guard let self else { return }
+            let probe = SpeechTranscriber(
+                locale: Languages.locale(for: newCode),
+                transcriptionOptions: [],
+                reportingOptions: [.volatileResults, .fastResults],
+                attributeOptions: [.audioTimeRange]
+            )
+            let status = await AssetInventory.status(forModules: [probe])
+            guard status == .installed else { return }
+            let shouldSwitch = self.lock.withLock { () -> Int? in
+                guard !self.stopped, newCode != self.langCode else { return nil }
+                self.langCode = newCode
+                self.generation += 1
+                return self.generation
+            }
+            guard let gen = shouldSwitch else { return }
+            await self.teardownCurrent()
+            await self.openSession(
+                generation: gen,
+                langCode: newCode,
+                replaySamples: replaySamples,
+                allowDownload: false
+            )
         }
     }
 
     func append(_ buffer: AVAudioPCMBuffer) {
         lock.withLock {
-            guard !stopped, let fmt = targetFormat, let cont = input else { return }
+            guard !stopped else { return }
+            guard let fmt = targetFormat, let cont = input else {
+                // Buffer audio received while SpeechAnalyzer is preparing so startup speech is never dropped.
+                let maxFrames = AVAudioFrameCount(max(buffer.format.sampleRate, 16_000) * 15)
+                if let copy = copyPCMBuffer(buffer) {
+                    pendingBuffers.append(copy)
+                    pendingFrames += copy.frameLength
+                    while pendingFrames > maxFrames, let oldest = pendingBuffers.first {
+                        pendingBuffers.removeFirst()
+                        pendingFrames -= min(pendingFrames, oldest.frameLength)
+                    }
+                }
+                return
+            }
             if let converted = convertBuffer(buffer, to: fmt, converter: &converter) {
                 fedSeconds += Double(converted.frameLength) / fmt.sampleRate
                 cont.yield(AnalyzerInput(buffer: converted))
@@ -326,6 +389,8 @@ private final class ModernAnalyzerStream {
         lock.withLock {
             stopped = true
             generation += 1
+            pendingBuffers.removeAll()
+            pendingFrames = 0
         }
         Task { [weak self] in
             await self?.teardownCurrent()
@@ -345,7 +410,10 @@ private final class ModernAnalyzerStream {
             cutTask = nil
             targetFormat = nil
             converter = nil
+            pendingBuffers.removeAll()
+            pendingFrames = 0
             lastVolatile = ""
+            lastCutDraft = ""
             return (a, i, r, c)
         }
         curCut?.cancel()
@@ -356,16 +424,23 @@ private final class ModernAnalyzerStream {
         _ = await curReader?.value
     }
 
-    private func openSession(generation gen: Int, langCode: String, replaySamples: [Float]?) async {
+    private func openSession(
+        generation gen: Int,
+        langCode: String,
+        replaySamples: [Float]?,
+        allowDownload: Bool
+    ) async {
         do {
             let locale = Languages.locale(for: langCode)
             let transcriber = SpeechTranscriber(
                 locale: locale,
                 transcriptionOptions: [],
                 reportingOptions: [.volatileResults, .fastResults],
-                attributeOptions: []
+                attributeOptions: [.audioTimeRange]
             )
-            if await AssetInventory.status(forModules: [transcriber]) != .installed {
+            let assetStatus = await AssetInventory.status(forModules: [transcriber])
+            if assetStatus != .installed {
+                guard allowDownload else { return }
                 if let req = try? await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
                     try await req.downloadAndInstall()
                 }
@@ -390,26 +465,42 @@ private final class ModernAnalyzerStream {
                 converter = nil
                 fedSeconds = 0
                 lastCutThrough = 0
+                lastResultEnd = 0
                 lastVolatile = ""
+                lastCutDraft = ""
+                lastCutAt = .distantPast
                 cutting = false
+
+                if let samples = replaySamples, !samples.isEmpty,
+                   let srcFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false),
+                   let srcBuf = AVAudioPCMBuffer(pcmFormat: srcFmt, frameCapacity: AVAudioFrameCount(samples.count)) {
+                    srcBuf.frameLength = AVAudioFrameCount(samples.count)
+                    if let ch = srcBuf.floatChannelData?[0] {
+                        samples.withUnsafeBufferPointer { ptr in
+                            if let base = ptr.baseAddress { ch.initialize(from: base, count: samples.count) }
+                        }
+                        if let converted = convertBuffer(srcBuf, to: fmt, converter: &converter) {
+                            fedSeconds += Double(converted.frameLength) / fmt.sampleRate
+                            cont.yield(AnalyzerInput(buffer: converted))
+                        }
+                    }
+                }
+
+                let queued = pendingBuffers
+                pendingBuffers.removeAll()
+                pendingFrames = 0
+                for buf in queued {
+                    if let converted = convertBuffer(buf, to: fmt, converter: &converter) {
+                        fedSeconds += Double(converted.frameLength) / fmt.sampleRate
+                        cont.yield(AnalyzerInput(buffer: converted))
+                    }
+                }
                 return true
             }
             guard installed else {
                 cont.finish()
                 await newAnalyzer.cancelAndFinishNow()
                 return
-            }
-
-            if let samples = replaySamples, !samples.isEmpty,
-               let srcFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false),
-               let srcBuf = AVAudioPCMBuffer(pcmFormat: srcFmt, frameCapacity: AVAudioFrameCount(samples.count)) {
-                srcBuf.frameLength = AVAudioFrameCount(samples.count)
-                if let ch = srcBuf.floatChannelData?[0] {
-                    samples.withUnsafeBufferPointer { ptr in
-                        if let base = ptr.baseAddress { ch.initialize(from: base, count: samples.count) }
-                    }
-                    append(srcBuf)
-                }
             }
 
             let reader = Task { [weak self] in
@@ -420,15 +511,23 @@ private final class ModernAnalyzerStream {
                         if !valid { break }
                         let text = String(r.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !text.isEmpty else { continue }
+                        let endSec = CMTimeGetSeconds(r.range.end)
                         self.lock.withLock {
                             if r.isFinal {
                                 self.lastVolatile = ""
-                                self.lastCutThrough = max(self.lastCutThrough, CMTimeGetSeconds(r.range.end))
+                                self.lastCutDraft = ""
+                                if endSec.isFinite {
+                                    self.lastCutThrough = max(self.lastCutThrough, endSec)
+                                    self.lastResultEnd = max(self.lastResultEnd, endSec)
+                                }
                             } else {
                                 if text != self.lastVolatile {
                                     self.lastVolatileAt = Date()
                                 }
                                 self.lastVolatile = text
+                                if endSec.isFinite {
+                                    self.lastResultEnd = max(self.lastResultEnd, endSec)
+                                }
                             }
                         }
                         self.onResult(RecognizedSegment(
@@ -447,7 +546,7 @@ private final class ModernAnalyzerStream {
                 }
             }
 
-            // Periodically finalize completed sentences so subtitles and translations commit briskly
+            // Conservative emergency valve only for very long run-on drafts; let SpeechTranscriber finalize normal pauses naturally.
             let cutter = Task { [weak self] in
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 250_000_000)
@@ -455,27 +554,19 @@ private final class ModernAnalyzerStream {
                     let cutPoint: Double? = self.lock.withLock {
                         guard !self.stopped && gen == self.generation && !self.cutting else { return nil }
                         let draft = self.lastVolatile
-                        guard !draft.isEmpty else { return nil }
-                        let deltaAudio = self.fedSeconds - self.lastCutThrough
-                        guard deltaAudio >= 0.4 else { return nil }
+                        guard !draft.isEmpty,
+                              draft != self.lastCutDraft,
+                              Date().timeIntervalSince(self.lastCutAt) >= 4.0 else { return nil }
                         let age = Date().timeIntervalSince(self.lastVolatileAt)
                         let hasCJK = draft.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
                         let size = hasCJK ? draft.count : draft.split(separator: " ").count
-                        let endsSentence = draft.last.map { "。！？.!?".contains($0) } ?? false
-
-                        if endsSentence && size >= (hasCJK ? 8 : 5) {
-                            self.cutting = true
-                            return self.fedSeconds
-                        }
-                        if size >= (hasCJK ? 18 : 11) && age >= 0.55 {
-                            self.cutting = true
-                            return self.fedSeconds
-                        }
-                        if size >= (hasCJK ? 34 : 22) && deltaAudio >= 2.0 {
-                            self.cutting = true
-                            return self.fedSeconds
-                        }
-                        return nil
+                        guard size >= (hasCJK ? 55 : 36),
+                              age >= 1.5,
+                              self.lastResultEnd > self.lastCutThrough + 3.0 else { return nil }
+                        self.cutting = true
+                        self.lastCutDraft = draft
+                        self.lastCutAt = Date()
+                        return self.lastResultEnd
                     }
                     if let through = cutPoint {
                         try? await newAnalyzer.finalize(through: CMTime(seconds: through, preferredTimescale: 1000))
@@ -663,11 +754,9 @@ private final class LegacySpeechStream {
 // MARK: - Language Auto-Detector
 
 final class LanguageDetector {
-    private let recognizer = NLLanguageRecognizer()
-
     func detectLanguageCode(for text: String, fallback: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 4 else { return fallback }
+        guard trimmed.count >= 12 else { return fallback }
 
         let hasKana = trimmed.unicodeScalars.contains { s in
             (0x3040...0x309F).contains(s.value) || (0x30A0...0x30FF).contains(s.value)
@@ -679,23 +768,15 @@ final class LanguageDetector {
         }
         if hasHangul { return "ko" }
 
-        let hasCJK = trimmed.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
-        if hasCJK { return "zh-CN" }
+        let hanCount = trimmed.unicodeScalars.filter { (0x4E00...0x9FFF).contains($0.value) }.count
+        if hanCount >= 4 { return "zh-CN" }
 
-        recognizer.reset()
-        recognizer.processString(trimmed)
-        if let dom = recognizer.dominantLanguage {
-            switch dom {
-            case .english: return "en"
-            case .simplifiedChinese: return "zh-CN"
-            case .traditionalChinese: return "zh-TW"
-            case .japanese: return "ja"
-            case .korean: return "ko"
-            case .spanish: return "es"
-            case .french: return "fr"
-            case .german: return "de"
-            case .portuguese: return "pt"
-            default: break
+        if fallback.hasPrefix("zh") || fallback == "ja" || fallback == "ko" {
+            let asciiLetters = trimmed.unicodeScalars.filter {
+                $0.isASCII && (($0.value >= 65 && $0.value <= 90) || ($0.value >= 97 && $0.value <= 122))
+            }.count
+            if asciiLetters >= 20 && hanCount == 0 && !hasKana && !hasHangul {
+                return "en"
             }
         }
         return fallback

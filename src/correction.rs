@@ -154,6 +154,97 @@ pub fn edit_distance(a: &str, b: &str) -> usize {
     row[bv.len()]
 }
 
+fn damerau_distance(a: &str, b: &str) -> usize {
+    let av: Vec<char> = a.chars().collect();
+    let bv: Vec<char> = b.chars().collect();
+    let n = av.len();
+    let m = bv.len();
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = usize::from(av[i - 1] != bv[j - 1]);
+            let mut best = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && av[i - 1] == bv[j - 2] && av[i - 2] == bv[j - 1] {
+                best = best.min(d[i - 2][j - 2] + cost);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[n][m]
+}
+
+fn latin_skeleton(s: &str) -> String {
+    let lower = s.to_ascii_lowercase().replace("ph", "f").replace('x', "ks");
+    let mut out = String::new();
+    let mut first_alpha = true;
+    for ch in lower.chars() {
+        if !ch.is_ascii_alphabetic() {
+            continue;
+        }
+        let mapped = match ch {
+            'c' | 'q' | 'g' => 'k',
+            'z' => 's',
+            'v' | 'f' | 'b' => 'p',
+            'd' => 't',
+            other => other,
+        };
+        let is_vowel = matches!(ch, 'a' | 'e' | 'i' | 'o' | 'u' | 'y' | 'w' | 'h');
+        if is_vowel {
+            if first_alpha {
+                out.push(mapped);
+            }
+            first_alpha = false;
+            continue;
+        }
+        first_alpha = false;
+        if !out.ends_with(mapped) {
+            out.push(mapped);
+        }
+    }
+    out
+}
+
+pub fn english_sounds_alike(a: &str, b: &str) -> bool {
+    let a_trim = a.trim();
+    let b_trim = b.trim();
+    if a_trim.is_empty()
+        || b_trim.is_empty()
+        || !a_trim.is_ascii()
+        || !b_trim.is_ascii()
+        || a_trim.split_whitespace().count() > 4
+        || b_trim.split_whitespace().count() > 4
+        || !a_trim.chars().any(|c| c.is_ascii_alphabetic())
+        || !b_trim.chars().any(|c| c.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    let al = a_trim.to_ascii_lowercase();
+    let bl = b_trim.to_ascii_lowercase();
+    if edit_distance(&al, &bl) <= 2 {
+        return true;
+    }
+    if al.len().abs_diff(bl.len()) > 6 {
+        return false;
+    }
+    let sa = latin_skeleton(&al);
+    let sb = latin_skeleton(&bl);
+    if sa.is_empty() || sb.is_empty() {
+        return false;
+    }
+    if sa.len().min(sb.len()) <= 3 {
+        return sa == sb;
+    }
+    damerau_distance(&sa, &sb) <= 2
+}
+
 pub fn decide<K, R>(edit: &Edit, known: K, rejected: R) -> Verdict
 where
     K: Fn(&str, &str) -> bool,
@@ -185,7 +276,11 @@ where
         && ct.is_ascii()
         && edit.confidence >= SPELLING_AT
         && cf.to_lowercase() != ct.to_lowercase()
-        && edit_distance(&cf.to_lowercase(), &ct.to_lowercase()) <= 2
+        && (english_sounds_alike(&cf, &ct)
+            || (edit.confidence >= 0.92
+                && name_shaped(&ct)
+                && cf.split_whitespace().count() <= 4
+                && ct.split_whitespace().count() <= 4))
     {
         return Verdict::Apply;
     }
@@ -513,5 +608,33 @@ mod tests {
         assert_eq!(res.0.from, "莫拉");
         assert_eq!(res.0.to, "Morpho");
         assert!(res.2);
+    }
+
+    #[test]
+    fn english_phonetic_and_context_fixes_apply() {
+        let cases = [
+            ("two", "too", 0.95),
+            ("ploy crusts", "pull requests", 0.95),
+            ("Floydcrusts", "pull requests", 0.95),
+            ("polar crests", "pull requests", 0.95),
+            ("polar quests", "pull requests", 0.95),
+            ("all flop", "all slop", 0.95),
+            ("Dropbot at SpaceXSI", "Grokbot at xAI", 0.95),
+        ];
+        for (from, to, confidence) in cases {
+            assert_eq!(
+                decide(
+                    &Edit {
+                        from: from.into(),
+                        to: to.into(),
+                        confidence,
+                    },
+                    |_, _| false,
+                    |_, _| false,
+                ),
+                Verdict::Apply,
+                "expected Apply for {from} -> {to}"
+            );
+        }
     }
 }

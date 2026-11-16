@@ -73,6 +73,7 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private var lastDraftSentAt = Date.distantPast
     private var draftSendInFlight = false
     private var lastLocalDraftAt = Date.distantPast
+    private var lastFinalPostTask: Task<Void, Never>?
 
     private var player: AVAudioPlayer?
     private var playbackTimer: Timer?
@@ -261,6 +262,7 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             selectedSession = started.session
             lastDraftSentAt = .distantPast
             draftSendInFlight = false
+            lastFinalPostTask = nil
 
             let initialLang = settings.sourceLang == "auto" ? "en" : settings.sourceLang
             currentActiveLang = initialLang
@@ -402,11 +404,9 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func handleRecognizedSegment(_ seg: RecognizedSegment, speaker: String, via: String) async {
         var effectiveLang = seg.lang
-        if settings.sourceLang == "auto", via == "system" {
+        if seg.isFinal, seg.text.count >= 12, settings.sourceLang == "auto", via == "system" {
             let detected = langDetector.detectLanguageCode(for: seg.text, fallback: currentActiveLang)
-            if detected != currentActiveLang,
-               Date().timeIntervalSince(lastAutoSwitchAt) > 6.0,
-               seg.text.count >= 6 {
+            if detected != currentActiveLang, Date().timeIntervalSince(lastAutoSwitchAt) > 6.0 {
                 lastAutoSwitchAt = Date()
                 currentActiveLang = detected
                 effectiveLang = detected
@@ -437,15 +437,20 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             }
             draftSendInFlight = true
             lastDraftSentAt = Date()
-            defer { draftSendInFlight = false }
-            try? await backend.postPiece(
-                text: seg.text,
-                speaker: speaker,
-                isFinal: false,
-                lang: effectiveLang,
-                via: via,
-                cut: false
-            )
+            let backend = self.backend
+            let text = seg.text
+            let lang = effectiveLang
+            Task { [weak self] in
+                defer { self?.draftSendInFlight = false }
+                try? await backend.postPiece(
+                    text: text,
+                    speaker: speaker,
+                    isFinal: false,
+                    lang: lang,
+                    via: via,
+                    cut: false
+                )
+            }
             return
         }
 
@@ -453,14 +458,24 @@ final class AppModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             draft = nil
         }
         onOverlayUpdated?()
-        try? await backend.postPiece(
-            text: seg.text,
-            speaker: speaker,
-            isFinal: true,
-            lang: effectiveLang,
-            via: via,
-            cut: seg.cut
-        )
+        let prevTask = lastFinalPostTask
+        let backend = self.backend
+        let text = seg.text
+        let lang = effectiveLang
+        let cut = seg.cut
+        let task = Task {
+            _ = await prevTask?.value
+            try? await backend.postPiece(
+                text: text,
+                speaker: speaker,
+                isFinal: true,
+                lang: lang,
+                via: via,
+                cut: cut
+            )
+        }
+        lastFinalPostTask = task
+        await task.value
     }
 
     private func markSpeechActivity() {

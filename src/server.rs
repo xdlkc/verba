@@ -1263,6 +1263,7 @@ async fn handle_listen_piece(
 
     let parts = split_sentences(&fuller_text);
     let mut touched_lines: Vec<TranscriptLine> = Vec::new();
+    let prev_for_recheck: Option<(String, String)>;
 
     {
         let mut store = state.store.lock().await;
@@ -1309,6 +1310,18 @@ async fn handle_listen_piece(
             touched_lines.push(line);
         }
 
+        prev_for_recheck = touched_lines.first().and_then(|first_touched| {
+            let session = store.get(&session_id)?;
+            let pos = session.lines.iter().position(|l| l.id == first_touched.id)?;
+            if pos >= 1 {
+                let prev = &session.lines[pos - 1];
+                if (first_touched.t - prev.t).abs() <= 12.0 {
+                    return Some((prev.id.clone(), prev.src.clone()));
+                }
+            }
+            None
+        });
+
         if let Some(session) = store.get(&session_id).cloned() {
             state.emit(ServerEvent::SessionUpdated {
                 session_id: session_id.clone(),
@@ -1330,6 +1343,17 @@ async fn handle_listen_piece(
                 TranslateKind::Sentence,
             )
             .await;
+    }
+
+    if let Some((prev_id, prev_src)) = prev_for_recheck {
+        let bg_state = Arc::clone(&state);
+        let sid = session_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let _ = bg_state
+                .translate_and_apply_line(&sid, &prev_id, &prev_src, TranslateKind::Sentence, true)
+                .await;
+        });
     }
 
     state.maybe_trigger_live_notes(session_id).await;

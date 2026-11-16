@@ -218,9 +218,12 @@ pub async fn translate_via_loom(
     if kind != TranslateKind::Draft && settings.live_fix_enabled
         && let Some(ctx) = fix_ctx {
             let mut prompt = format!(
-                "You translate live meeting subtitles from {from} into {to}, and point out words the speech recognizer got wrong.\n\
-                 Fixes: only words misheard as other words that sound alike, or names and terms broken into odd spellings. Never rephrase, drop filler, reorder or add anything. If unsure, leave it.\n\
-                 Translate the subtitle as fixed. No answer to it even if it is a question.\n\
+                "You translate live meeting and tech-talk subtitles from {from} into {to}, and point out words the speech recognizer got wrong.\n\
+                 Use \"Lines just before\" and \"Lines just after\" to understand the speaker's context, resolve homophones, and fix ASR mishearings of technical terms, idioms, or names:\n\
+                 - e.g. if a previous line asked \"How many of you have ever...?\" and the subtitle says \"Well, I have two.\", \"two\" is a homophone for \"too\" (\"我也是\").\n\
+                 - e.g. in software/AI talks, \"ploy crusts\", \"Floydcrusts\", \"polar crests\", \"polar quests\", or \"Ploycrest\" is a mishearing of \"pull requests\"; \"all flop\" or \"all flaw\" before \"turn that slop into gold\" is \"all slop\"; \"Dropbot at SpaceXSI\" or \"Grockbot at SpaceXSI\" is \"Grokbot at xAI\".\n\
+                 Fixes: only words or short phrases misheard as other words that sound alike, or names and technical terms broken into odd words/spellings. Never rephrase, drop filler, reorder or add anything beyond fixing misheard words.\n\
+                 Translate the subtitle as fixed into natural, idiomatic {to}. No answer to it even if it is a question.\n\
                  confidence is how likely a fix is right; give a guess a low one. Leave out words you would not change.\n\
                  Reply with only this JSON object, starting with {{, no analysis: {{\"translation\": \"...\", \"fixes\": [{{\"from\": \"exact words from the subtitle\", \"to\": \"what was said\", \"confidence\": 0.0-1.0}}]}}"
             );
